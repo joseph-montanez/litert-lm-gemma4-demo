@@ -1,46 +1,60 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <style>
 :root {
-  color-scheme: dark;
-  --bg:#0b0d12; --panel:#131722; --panel2:#191f2d;
-  --text:#eef2ff; --muted:#9aa6bd; --line:#293146;
-  --accent:#7aa2ff; --user:#20365e; --assistant:#171d29;
+  /* dark (default) */
+  --bg:#0d0d0d; --panel:#1a1a1a; --panel2:#262626;
+  --text:#fafafa; --muted:#a3a3a3; --line:#333333;
+  --accent:#3b82f6; --user:#1a1a1a; --assistant:#1a1a1a;
+  --reasoning-bg:#0d0d0d; --reasoning-text:#d4d4d4;
+  --shadow:0 1px 3px rgba(0,0,0,.8);
+}
+[data-theme="light"] {
+  --bg:#ffffff; --panel:#ffffff; --panel2:#f5f5f5;
+  --text:#171717; --muted:#737373; --line:#e5e5e5;
+  --accent:#2563eb; --user:#eff6ff; --assistant:#ffffff;
+  --reasoning-bg:#fafafa; --reasoning-text:#525252;
+  --shadow:0 1px 3px rgba(0,0,0,.04);
 }
 * { box-sizing:border-box; }
+*,*::before,*::after { transition:background-color .25s ease,border-color .25s ease,color .15s ease; }
 body { margin:0; background:var(--bg); color:var(--text);
   font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
 main { height:100vh; display:grid; grid-template-rows:auto 1fr auto; }
 header { padding:12px 18px; border-bottom:1px solid var(--line);
   background:var(--panel); display:flex; gap:12px; align-items:center;
-  flex-wrap:wrap; }
+  flex-wrap:wrap; box-shadow:var(--shadow); }
 header strong { margin-right:auto; }
-label { color:var(--muted); font-size:13px; }
+label { color:var(--muted); font-size:12px; }
 select,input,button,textarea { font:inherit; }
 select,input { background:var(--panel2); color:var(--text);
   border:1px solid var(--line); border-radius:7px; padding:6px 8px; }
-button { background:var(--accent); color:#071226; border:0;
+button { background:var(--accent); color:#fff; border:0;
   border-radius:8px; padding:8px 12px; font-weight:650; cursor:pointer; }
 button.secondary { background:var(--panel2); color:var(--text);
   border:1px solid var(--line); }
 button:disabled { opacity:.5; cursor:not-allowed; }
+#themeToggle { background:var(--panel2); color:var(--text);
+  border:1px solid var(--line); border-radius:8px; padding:8px 12px;
+  font-size:15px; cursor:pointer; line-height:1; }
 #messages { overflow:auto; padding:24px max(18px,calc((100vw - 900px)/2));
   display:flex; flex-direction:column; gap:16px; }
 .message { border:1px solid var(--line); border-radius:12px;
-  padding:14px 16px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  padding:14px 16px; white-space:pre-wrap; overflow-wrap:anywhere;
+  box-shadow:var(--shadow); }
 .user { background:var(--user); align-self:flex-end; max-width:82%; }
 .assistant { background:var(--assistant); align-self:stretch; }
 .role { color:var(--muted); font-size:12px; text-transform:uppercase;
   letter-spacing:.08em; margin-bottom:6px; }
 .reasoning { margin:0 0 12px; border:1px solid var(--line);
-  border-radius:8px; background:#10141d; }
+  border-radius:8px; background:var(--reasoning-bg); }
 .reasoning summary { cursor:pointer; color:var(--muted); padding:8px 10px; }
 .reasoning pre { margin:0; padding:0 10px 10px; white-space:pre-wrap;
-  color:#bdc8dc; font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+  color:var(--reasoning-text); font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .metrics { color:var(--muted); font-size:12px; margin-top:10px; }
 form { border-top:1px solid var(--line); background:var(--panel);
   padding:12px max(18px,calc((100vw - 900px)/2)); }
@@ -63,9 +77,22 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
     </select>
   </label>
   <label>Temperature <input id="temperature" type="number" min="0" max="2"
-    step="0.05" value="1.0" style="width:72px"></label>
-  <label>Max output <input id="maxTokens" type="number" min="1"
-    value="4096" style="width:90px"></label>
+    step="0.05" value="1.0" style="width:64px"></label>
+  <label>Max out <input id="maxTokens" type="number" min="1"
+    value="4096" style="width:76px"></label>
+  <label>Top-P <input id="topP" type="number" min="0" max="1"
+    step="0.05" value="0.95" style="width:64px"></label>
+  <label>Top-K <input id="topK" type="number" min="1" max="256"
+    step="1" value="64" style="width:64px"></label>
+  <label>Seed <input id="seed" type="number" min="0"
+    placeholder="auto" style="width:72px"></label>
+  <label>Rep.pen <input id="repPenalty" type="number" min="1" max="2"
+    step="0.01" value="1.12" style="width:68px"></label>
+  <label>Freq.pen <input id="freqPenalty" type="number" min="-2" max="2"
+    step="0.1" value="0" style="width:68px"></label>
+  <label>Pres.pen <input id="presPenalty" type="number" min="-2" max="2"
+    step="0.1" value="0" style="width:68px"></label>
+  <button id="themeToggle" type="button" title="Toggle light/dark theme">☀️</button>
   <button id="newChat" class="secondary" type="button">New chat</button>
 </header>
 
@@ -94,7 +121,26 @@ const promptBox = document.getElementById("prompt");
 const status = document.getElementById("status");
 const sendButton = document.getElementById("send");
 const stopButton = document.getElementById("stop");
+const themeToggle = document.getElementById("themeToggle");
 let controller = null;
+
+// --- theme ---
+function getTheme() {
+  const saved = localStorage.getItem("litert-theme");
+  if (saved === "light" || saved === "dark") return saved;
+  if (window.matchMedia?.("(prefers-color-scheme: light)").matches) return "light";
+  return "dark";
+}
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  themeToggle.textContent = theme === "light" ? "🌙" : "☀️";
+  localStorage.setItem("litert-theme", theme);
+}
+applyTheme(getTheme());
+themeToggle.addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  applyTheme(next);
+});
 
 function addMessage(role, text="") {
   empty.style.display = "none";
@@ -145,6 +191,12 @@ async function sendMessage(text) {
     reasoning_effort: document.getElementById("effort").value,
     temperature: Number(document.getElementById("temperature").value),
     max_completion_tokens: Number(document.getElementById("maxTokens").value),
+    top_p: Number(document.getElementById("topP").value),
+    top_k: Number(document.getElementById("topK").value),
+    repetition_penalty: Number(document.getElementById("repPenalty").value),
+    frequency_penalty: Number(document.getElementById("freqPenalty").value),
+    presence_penalty: Number(document.getElementById("presPenalty").value),
+    seed: Number(document.getElementById("seed").value) || null,
     messages
   };
 
