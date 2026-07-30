@@ -5,9 +5,10 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import litert_lm
+from pydantic import BaseModel, ConfigDict
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
@@ -21,6 +22,7 @@ from .config import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     ENABLE_CONSTRAINED_DECODING,
+    ENABLE_SPECULATIVE_DECODING,
     INFERENCE_TIMEOUT_SECONDS,
     MALFORMED_TOOL_CALL_RETRIES,
     MAX_NUM_TOKENS,
@@ -35,6 +37,24 @@ from .config import (
     conversation_worker,
 )
 from .models import ChatCompletionRequest, InferenceJob
+
+
+class AdminReconfigureRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    max_num_tokens: Optional[int] = None
+    default_max_output_tokens: Optional[int] = None
+    max_tool_response_tokens: Optional[int] = None
+    context_safety_margin_tokens: Optional[int] = None
+    inference_timeout_seconds: Optional[float] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    reasoning_effort: Optional[str] = None
+    repetition_penalty: Optional[float] = None
+    constrained_decoding: Optional[bool] = None
+    speculative_decoding: Optional[bool] = None
+    malformed_tool_call_retries: Optional[int] = None
 from .utils.message import canonical_messages
 from .utils.token import (
     count_tokens,
@@ -123,7 +143,7 @@ async def lifespan(app: FastAPI):
 
     engine_kwargs: dict[str, Any] = {
         "backend": litert_lm.Backend.GPU(),
-        "enable_speculative_decoding": False,
+        "enable_speculative_decoding": ENABLE_SPECULATIVE_DECODING,
         "max_num_tokens": MAX_NUM_TOKENS,
     }
 
@@ -544,3 +564,144 @@ async def chat_completions(
         ) from exc
     finally:
         _request_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Engine lifecycle helper
+# ---------------------------------------------------------------------------
+
+
+def _create_engine():
+    engine_kwargs: dict[str, Any] = {
+        "backend": litert_lm.Backend.GPU(),
+        "enable_speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
+        "max_num_tokens": config.MAX_NUM_TOKENS,
+    }
+
+    engine_parameters = set(
+        inspect.signature(litert_lm.Engine).parameters
+    )
+
+    if "cache_dir" in engine_parameters:
+        engine_kwargs["cache_dir"] = CACHE_DIR
+
+    engine = litert_lm.Engine(
+        MODEL_PATH,
+        **engine_kwargs,
+    )
+    engine.__enter__()
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Admin routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/admin/config")
+async def admin_get_config():
+    return {
+        "max_num_tokens": config.MAX_NUM_TOKENS,
+        "default_max_output_tokens": config.DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_tool_response_tokens": config.MAX_TOOL_RESPONSE_TOKENS,
+        "context_safety_margin_tokens": config.CONTEXT_SAFETY_MARGIN_TOKENS,
+        "inference_timeout_seconds": config.INFERENCE_TIMEOUT_SECONDS,
+        "temperature": config.DEFAULT_TEMPERATURE,
+        "top_p": config.DEFAULT_TOP_P,
+        "top_k": config.DEFAULT_TOP_K,
+        "reasoning_effort": config.DEFAULT_REASONING_EFFORT,
+        "repetition_penalty": config.DEFAULT_REPETITION_PENALTY,
+        "constrained_decoding": config.ENABLE_CONSTRAINED_DECODING,
+        "speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
+        "malformed_tool_call_retries": config.MALFORMED_TOOL_CALL_RETRIES,
+    }
+
+
+@app.post("/v1/admin/reconfigure")
+async def admin_reconfigure(body: AdminReconfigureRequest):
+    global engine, conversation_worker
+
+    if not _request_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot reconfigure while generation is active.",
+        )
+
+    try:
+        changed = []
+
+        if body.max_num_tokens is not None:
+            config.MAX_NUM_TOKENS = body.max_num_tokens
+            changed.append(f"max_num_tokens={body.max_num_tokens}")
+        if body.default_max_output_tokens is not None:
+            config.DEFAULT_MAX_OUTPUT_TOKENS = body.default_max_output_tokens
+            changed.append(f"default_max_output_tokens={body.default_max_output_tokens}")
+        if body.max_tool_response_tokens is not None:
+            config.MAX_TOOL_RESPONSE_TOKENS = body.max_tool_response_tokens
+            changed.append(f"max_tool_response_tokens={body.max_tool_response_tokens}")
+        if body.context_safety_margin_tokens is not None:
+            config.CONTEXT_SAFETY_MARGIN_TOKENS = body.context_safety_margin_tokens
+            changed.append(f"context_safety_margin_tokens={body.context_safety_margin_tokens}")
+        if body.inference_timeout_seconds is not None:
+            config.INFERENCE_TIMEOUT_SECONDS = body.inference_timeout_seconds
+            changed.append(f"inference_timeout_seconds={body.inference_timeout_seconds}")
+        if body.temperature is not None:
+            config.DEFAULT_TEMPERATURE = body.temperature
+            changed.append(f"temperature={body.temperature}")
+        if body.top_p is not None:
+            config.DEFAULT_TOP_P = body.top_p
+            changed.append(f"top_p={body.top_p}")
+        if body.top_k is not None:
+            config.DEFAULT_TOP_K = body.top_k
+            changed.append(f"top_k={body.top_k}")
+        if body.reasoning_effort is not None:
+            config.DEFAULT_REASONING_EFFORT = body.reasoning_effort
+            changed.append(f"reasoning_effort={body.reasoning_effort}")
+        if body.repetition_penalty is not None:
+            config.DEFAULT_REPETITION_PENALTY = body.repetition_penalty
+            changed.append(f"repetition_penalty={body.repetition_penalty}")
+        if body.constrained_decoding is not None:
+            config.ENABLE_CONSTRAINED_DECODING = body.constrained_decoding
+            changed.append(f"constrained_decoding={body.constrained_decoding}")
+        if body.speculative_decoding is not None:
+            config.ENABLE_SPECULATIVE_DECODING = body.speculative_decoding
+            changed.append(f"speculative_decoding={body.speculative_decoding}")
+        if body.malformed_tool_call_retries is not None:
+            config.MALFORMED_TOOL_CALL_RETRIES = body.malformed_tool_call_retries
+            changed.append(f"malformed_tool_call_retries={body.malformed_tool_call_retries}")
+
+        if not changed:
+            return {"status": "unchanged", "changes": []}
+
+        print(f"\n[admin] Reconfiguring: {', '.join(changed)}")
+
+        # Stop and tear down current engine + worker
+        if conversation_worker is not None:
+            conversation_worker.stop()
+            conversation_worker = None
+            config.conversation_worker = None
+
+        if engine is not None:
+            config.engine.__exit__(None, None, None)
+            config.engine = None
+            engine = None
+
+        # Recreate
+        engine = _create_engine()
+        config.engine = engine
+
+        from .engine.worker import PersistentConversationWorker
+
+        conversation_worker = PersistentConversationWorker()
+        conversation_worker.start()
+        config.conversation_worker = conversation_worker
+
+        print("[admin] Engine restarted with new configuration.")
+
+        return {"status": "restarted", "changes": changed}
+    except Exception:
+        _request_lock.release()
+        raise
+    finally:
+        if _request_lock.locked():
+            _request_lock.release()

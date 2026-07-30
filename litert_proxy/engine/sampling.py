@@ -231,9 +231,9 @@ def build_conversation_kwargs(
     request: ChatCompletionRequest,
     initial_messages: list[Any],
 ) -> dict[str, Any]:
-    from ..config import engine
+    from .. import config as _sampling_cfg
 
-    parameters = set(inspect.signature(engine.create_conversation).parameters)
+    parameters = set(inspect.signature(_sampling_cfg.engine.create_conversation).parameters)
     kwargs: dict[str, Any] = {
         "messages": initial_messages,
     }

@@ -64,6 +64,23 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
 .actions { display:flex; justify-content:space-between; margin-top:8px; }
 #status { color:var(--muted); font-size:12px; }
 .empty { color:var(--muted); text-align:center; margin:auto; }
+
+/* modal */
+.overlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
+  display:flex; align-items:center; justify-content:center; z-index:100; }
+.overlay.hidden { display:none; }
+.modal { background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; padding:24px 28px; max-width:520px; width:94vw;
+  max-height:90vh; overflow:auto; box-shadow:0 8px 32px rgba(0,0,0,.35); }
+.modal h2 { margin:0 0 6px; font-size:18px; }
+.modal .warning { background:var(--reasoning-bg); border:1px solid var(--line);
+  border-radius:8px; padding:10px 14px; margin:14px 0;
+  color:var(--muted); font-size:13px; display:flex; gap:8px; align-items:flex-start; }
+.modal .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 16px; }
+.modal .grid label { display:flex; flex-direction:column; gap:3px; }
+.modal .grid input { width:100%; }
+.modal .btns { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+#serverStatus { color:var(--muted); font-size:12px; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -93,6 +110,7 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   <label>Pres.pen <input id="presPenalty" type="number" min="-2" max="2"
     step="0.1" value="0" style="width:68px"></label>
   <button id="themeToggle" type="button" title="Toggle light/dark theme">☀️</button>
+  <button id="serverBtn" class="secondary" type="button">⚙️ Server</button>
   <button id="newChat" class="secondary" type="button">New chat</button>
 </header>
 
@@ -111,6 +129,24 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   </div>
 </form>
 </main>
+
+<div class="overlay hidden" id="serverOverlay">
+  <div class="modal">
+    <h2>⚙️ Server Settings</h2>
+    <div class="warning">
+      <span>⚠️</span>
+      <span>Changing these settings will <strong>restart the engine</strong> and clear all conversation state. In-flight generations will be cancelled.</span>
+    </div>
+    <div class="grid" id="serverGrid">
+      <!-- populated by JS -->
+    </div>
+    <span id="serverStatus"></span>
+    <div class="btns">
+      <button class="secondary" id="serverCancel" type="button">Cancel</button>
+      <button id="serverRestart" type="button">Restart Engine</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const messages = [];
@@ -304,6 +340,112 @@ document.getElementById("newChat").addEventListener("click", async () => {
   empty.style.display = "";
   status.textContent = "New conversation";
   promptBox.focus();
+});
+
+// --- server settings modal ---
+const serverFields = [
+  {id:"sMaxNumTokens", key:"max_num_tokens", label:"Context window (tokens)", min:2048, type:"number"},
+  {id:"sMaxOutTokens", key:"default_max_output_tokens", label:"Default max output tokens", min:64, type:"number"},
+  {id:"sToolRespTokens", key:"max_tool_response_tokens", label:"Max tool response tokens", min:64, type:"number"},
+  {id:"sSafetyMargin", key:"context_safety_margin_tokens", label:"Safety margin (tokens)", min:64, type:"number"},
+  {id:"sTimeout", key:"inference_timeout_seconds", label:"Inference timeout (seconds)", min:10, type:"number"},
+  {id:"sTemperature", key:"temperature", label:"Default temperature", min:0, max:2, step:0.05, type:"number"},
+  {id:"sTopP", key:"top_p", label:"Default Top-P", min:0, max:1, step:0.05, type:"number"},
+  {id:"sTopK", key:"top_k", label:"Default Top-K", min:1, max:256, type:"number"},
+  {id:"sReasoning", key:"reasoning_effort", label:"Reasoning effort", type:"select", options:["none","minimal","low","medium","high","xhigh"]},
+  {id:"sRepPenalty", key:"repetition_penalty", label:"Repetition penalty", min:1, max:2, step:0.01, type:"number"},
+  {id:"sRetries", key:"malformed_tool_call_retries", label:"Tool-call retries", min:0, max:5, type:"number"},
+  {id:"sConstrained", key:"constrained_decoding", label:"Constrained decoding", type:"select", options:["true","false"]},
+  {id:"sSpecDecoding", key:"speculative_decoding", label:"Speculative decoding", type:"select", options:["true","false"]},
+];
+
+const overlay = document.getElementById("serverOverlay");
+const serverGrid = document.getElementById("serverGrid");
+const serverStatus = document.getElementById("serverStatus");
+
+function buildGrid(config) {
+  serverGrid.innerHTML = "";
+  serverFields.forEach(f => {
+    const label = document.createElement("label");
+    label.textContent = f.label;
+    let input;
+    if (f.type === "select") {
+      input = document.createElement("select");
+      f.options.forEach(o => {
+        const opt = document.createElement("option");
+        opt.value = o; opt.textContent = o;
+        if (String(config[f.key]) === o) opt.selected = true;
+        input.appendChild(opt);
+      });
+    } else {
+      input = document.createElement("input");
+      input.type = f.type;
+      if (f.min != null) input.min = f.min;
+      if (f.max != null) input.max = f.max;
+      if (f.step != null) input.step = f.step;
+      input.value = config[f.key] ?? "";
+    }
+    input.id = f.id;
+    label.appendChild(input);
+    serverGrid.appendChild(label);
+  });
+}
+
+async function openServerModal() {
+  serverStatus.textContent = "Loading current config…";
+  overlay.classList.remove("hidden");
+  try {
+    const resp = await fetch("/v1/admin/config");
+    if (!resp.ok) throw new Error(await resp.text());
+    const config = await resp.json();
+    buildGrid(config);
+    serverStatus.textContent = "";
+  } catch (e) {
+    serverStatus.textContent = "Failed to load: " + e.message;
+  }
+}
+
+function closeServerModal() {
+  overlay.classList.add("hidden");
+}
+
+document.getElementById("serverBtn").addEventListener("click", openServerModal);
+document.getElementById("serverCancel").addEventListener("click", closeServerModal);
+overlay.addEventListener("click", e => { if (e.target === overlay) closeServerModal(); });
+
+document.getElementById("serverRestart").addEventListener("click", async () => {
+  const body = {};
+  serverFields.forEach(f => {
+    const el = document.getElementById(f.id);
+    if (!el) return;
+    let val = el.value;
+    if (f.type === "number") {
+      val = val === "" ? null : Number(val);
+    } else if (f.key === "constrained_decoding" || f.key === "speculative_decoding") {
+      val = val === "true";
+    }
+    body[f.key] = val;
+  });
+
+  serverStatus.textContent = "Restarting engine…";
+  document.getElementById("serverRestart").disabled = true;
+  try {
+    const resp = await fetch("/v1/admin/reconfigure", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+    serverStatus.textContent = "Done. " + result.changes.join(", ");
+    // Refresh the displayed config
+    const cfg = await fetch("/v1/admin/config").then(r => r.json());
+    buildGrid(cfg);
+  } catch (e) {
+    serverStatus.textContent = "Error: " + e.message;
+  } finally {
+    document.getElementById("serverRestart").disabled = false;
+  }
 });
 </script>
 </body>

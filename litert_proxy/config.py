@@ -88,6 +88,11 @@ ANTI_REPEAT_INSTRUCTION = (
 
 TOOL_USE_INSTRUCTION = ""
 
+ENABLE_SPECULATIVE_DECODING = os.environ.get(
+    "LITERT_SPECULATIVE_DECODING",
+    "0",
+).strip().lower() not in {"0", "false", "no", "off"}
+
 engine = None
 conversation_worker = None
 

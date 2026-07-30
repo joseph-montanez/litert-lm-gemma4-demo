@@ -2,12 +2,12 @@ import json
 import sys
 from typing import Any
 
+from .. import config as _cfg
 from ..config import (
     MAX_TOOL_RESPONSE_TOKENS,
     ANTI_REPEAT_INSTRUCTION,
     CONTEXT_SAFETY_MARGIN_TOKENS,
     _console_lock,
-    engine,
 )
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def count_tokens(text: str) -> int:
         return 0
 
     try:
-        return len(engine.tokenize(text))
+        return len(_cfg.engine.tokenize(text))
     except Exception:
         return max(1, round(len(text) / 4))
 

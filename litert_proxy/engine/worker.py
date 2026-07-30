@@ -9,7 +9,6 @@ from .. import config
 from ..config import (
     MALFORMED_TOOL_CALL_RETRIES,
     _console_lock,
-    engine,
 )
 from ..models import (
     ChatCompletionRequest,
@@ -220,7 +219,7 @@ class PersistentConversationWorker:
             )
 
         try:
-            with engine.create_conversation(
+            with config.engine.create_conversation(
                 **conversation_kwargs
             ) as conversation:
                 self._active_conversation = conversation
@@ -330,7 +329,7 @@ class PersistentConversationWorker:
                 job.request,
                 plan.initial_messages or [],
             )
-            self._conversation = engine.create_conversation(
+            self._conversation = config.engine.create_conversation(
                 **conversation_kwargs
             )
             self._config_signature = config_signature
