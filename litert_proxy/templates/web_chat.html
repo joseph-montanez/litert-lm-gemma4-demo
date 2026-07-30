@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg:#0b0d12; --panel:#131722; --panel2:#191f2d;
+  --text:#eef2ff; --muted:#9aa6bd; --line:#293146;
+  --accent:#7aa2ff; --user:#20365e; --assistant:#171d29;
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text);
+  font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { height:100vh; display:grid; grid-template-rows:auto 1fr auto; }
+header { padding:12px 18px; border-bottom:1px solid var(--line);
+  background:var(--panel); display:flex; gap:12px; align-items:center;
+  flex-wrap:wrap; }
+header strong { margin-right:auto; }
+label { color:var(--muted); font-size:13px; }
+select,input,button,textarea { font:inherit; }
+select,input { background:var(--panel2); color:var(--text);
+  border:1px solid var(--line); border-radius:7px; padding:6px 8px; }
+button { background:var(--accent); color:#071226; border:0;
+  border-radius:8px; padding:8px 12px; font-weight:650; cursor:pointer; }
+button.secondary { background:var(--panel2); color:var(--text);
+  border:1px solid var(--line); }
+button:disabled { opacity:.5; cursor:not-allowed; }
+#messages { overflow:auto; padding:24px max(18px,calc((100vw - 900px)/2));
+  display:flex; flex-direction:column; gap:16px; }
+.message { border:1px solid var(--line); border-radius:12px;
+  padding:14px 16px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.user { background:var(--user); align-self:flex-end; max-width:82%; }
+.assistant { background:var(--assistant); align-self:stretch; }
+.role { color:var(--muted); font-size:12px; text-transform:uppercase;
+  letter-spacing:.08em; margin-bottom:6px; }
+.reasoning { margin:0 0 12px; border:1px solid var(--line);
+  border-radius:8px; background:#10141d; }
+.reasoning summary { cursor:pointer; color:var(--muted); padding:8px 10px; }
+.reasoning pre { margin:0; padding:0 10px 10px; white-space:pre-wrap;
+  color:#bdc8dc; font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.metrics { color:var(--muted); font-size:12px; margin-top:10px; }
+form { border-top:1px solid var(--line); background:var(--panel);
+  padding:12px max(18px,calc((100vw - 900px)/2)); }
+textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
+  background:var(--panel2); color:var(--text); border:1px solid var(--line);
+  border-radius:10px; padding:11px; }
+.actions { display:flex; justify-content:space-between; margin-top:8px; }
+#status { color:var(--muted); font-size:12px; }
+.empty { color:var(--muted); text-align:center; margin:auto; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <strong>{title}</strong>
+  <label>Thinking
+    <select id="effort">
+      <option>none</option><option>low</option><option>medium</option>
+      <option selected>high</option><option>xhigh</option>
+    </select>
+  </label>
+  <label>Temperature <input id="temperature" type="number" min="0" max="2"
+    step="0.05" value="1.0" style="width:72px"></label>
+  <label>Max output <input id="maxTokens" type="number" min="1"
+    value="4096" style="width:90px"></label>
+  <button id="newChat" class="secondary" type="button">New chat</button>
+</header>
+
+<section id="messages">
+  <div class="empty" id="empty">No tools, MCP, skills, or AGENTS.md are loaded here.</div>
+</section>
+
+<form id="composer">
+  <textarea id="prompt" placeholder="Message the local model…" required></textarea>
+  <div class="actions">
+    <span id="status">Ready</span>
+    <div>
+      <button id="stop" class="secondary" type="button" disabled>Stop</button>
+      <button id="send" type="submit">Send</button>
+    </div>
+  </div>
+</form>
+</main>
+
+<script>
+const messages = [];
+const list = document.getElementById("messages");
+const empty = document.getElementById("empty");
+const form = document.getElementById("composer");
+const promptBox = document.getElementById("prompt");
+const status = document.getElementById("status");
+const sendButton = document.getElementById("send");
+const stopButton = document.getElementById("stop");
+let controller = null;
+
+function addMessage(role, text="") {
+  empty.style.display = "none";
+  const box = document.createElement("article");
+  box.className = `message ${role}`;
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = role;
+  const reasoning = document.createElement("details");
+  reasoning.className = "reasoning";
+  reasoning.open = true;
+  reasoning.style.display = "none";
+  const summary = document.createElement("summary");
+  summary.textContent = "Thinking";
+  const reasoningText = document.createElement("pre");
+  reasoning.append(summary, reasoningText);
+  const content = document.createElement("div");
+  content.textContent = text;
+  const metrics = document.createElement("div");
+  metrics.className = "metrics";
+  box.append(roleEl, reasoning, content, metrics);
+  list.appendChild(box);
+  list.scrollTop = list.scrollHeight;
+  return {box, content, reasoning, reasoningText, metrics};
+}
+
+function parseEvent(block) {
+  const lines = block.split(/\r?\n/);
+  const data = lines.filter(x => x.startsWith("data:"))
+    .map(x => x.slice(5).trim()).join("\n");
+  return data;
+}
+
+async function sendMessage(text) {
+  const user = {role:"user", content:text};
+  messages.push(user);
+  addMessage("user", text);
+  const assistant = addMessage("assistant");
+  controller = new AbortController();
+  sendButton.disabled = true;
+  stopButton.disabled = false;
+  status.textContent = "Generating…";
+
+  const body = {
+    model: "local-litert",
+    stream: true,
+    include_reasoning: true,
+    reasoning_effort: document.getElementById("effort").value,
+    temperature: Number(document.getElementById("temperature").value),
+    max_completion_tokens: Number(document.getElementById("maxTokens").value),
+    messages
+  };
+
+  let answer = "";
+  let thinking = "";
+
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body),
+      signal:controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream:true});
+
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = parseEvent(block);
+        if (!data || data === "[DONE]") continue;
+
+        const event = JSON.parse(data);
+        if (event.error) throw new Error(event.error.message);
+
+        const delta = event.choices?.[0]?.delta || {};
+        if (delta.reasoning_content) {
+          thinking += delta.reasoning_content;
+          assistant.reasoning.style.display = "";
+          assistant.reasoningText.textContent = thinking;
+        }
+        if (delta.content) {
+          answer += delta.content;
+          assistant.content.textContent = answer;
+        }
+        if (event.usage) {
+          const u = event.usage;
+          const fields = [];
+          if (u.time_to_first_token != null)
+            fields.push(`TTFT ${u.time_to_first_token.toFixed(2)}s`);
+          if (u.prefill_tokens_per_second != null)
+            fields.push(`PPS ${u.prefill_tokens_per_second.toFixed(1)}`);
+          if (u.decode_tokens_per_second != null)
+            fields.push(`TPS ${u.decode_tokens_per_second.toFixed(1)}`);
+          if (u.reasoning_tokens != null)
+            fields.push(`thinking ${u.reasoning_tokens} tok`);
+          assistant.metrics.textContent = fields.join(" · ");
+        }
+        list.scrollTop = list.scrollHeight;
+      }
+    }
+
+    if (!answer && !thinking) throw new Error("The model returned no content.");
+    messages.push({role:"assistant", content:answer || ""});
+    status.textContent = "Ready";
+  } catch (error) {
+    if (error.name === "AbortError") {
+      status.textContent = "Stopped";
+    } else {
+      assistant.content.textContent = `Error: ${error.message}`;
+      status.textContent = "Error";
+    }
+  } finally {
+    controller = null;
+    sendButton.disabled = false;
+    stopButton.disabled = true;
+    promptBox.focus();
+  }
+}
+
+form.addEventListener("submit", event => {
+  event.preventDefault();
+  const text = promptBox.value.trim();
+  if (!text || controller) return;
+  promptBox.value = "";
+  sendMessage(text);
+});
+
+promptBox.addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
+
+stopButton.addEventListener("click", () => controller?.abort());
+
+document.getElementById("newChat").addEventListener("click", async () => {
+  controller?.abort();
+  await fetch("/v1/conversation/reset", {method:"POST"});
+  messages.length = 0;
+  list.replaceChildren(empty);
+  empty.style.display = "";
+  status.textContent = "New conversation";
+  promptBox.focus();
+});
+</script>
+</body>
+</html>
