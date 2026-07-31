@@ -62,6 +62,9 @@ MALFORMED_TOOL_CALL_RETRIES = int(
 MAX_TOOL_ARGUMENT_STRING_LENGTH = int(
     os.environ.get("LITERT_MAX_TOOL_ARGUMENT_LENGTH", "16384")
 )
+MAX_TOOL_CALLS_PER_GENERATION = int(
+    os.environ.get("LITERT_MAX_TOOL_CALLS_PER_GENERATION", "6")
+)
 CACHE_DIR = os.environ.get(
     "LITERT_CACHE_DIR",
     str(Path(MODEL_PATH).resolve().parent),

@@ -8,6 +8,7 @@ from typing import Any
 
 import litert_lm
 
+from . import config as _config
 from .utils.token import truncate_tool_content
 
 
@@ -17,7 +18,6 @@ MAX_GREP_RESULTS = 100
 MAX_READ_LINES = 1000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOOL_RESULT_CHARS = 50_000
-MAX_TOOL_CALLS_PER_GENERATION = 6
 MAX_IDENTICAL_TOOL_CALLS = 2
 
 
@@ -143,7 +143,7 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
 
         print(
             f"\n[workspace-tool-call] {call_count}/"
-            f"{MAX_TOOL_CALLS_PER_GENERATION} name={name}",
+            f"{_config.MAX_TOOL_CALLS_PER_GENERATION} name={name}",
             file=sys.stderr,
             flush=True,
         )
@@ -153,7 +153,7 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
                 f"Workspace tool '{name}' repeated the same call more than "
                 f"{MAX_IDENTICAL_TOOL_CALLS} times."
             )
-        if call_count > MAX_TOOL_CALLS_PER_GENERATION:
+        if call_count > _config.MAX_TOOL_CALLS_PER_GENERATION:
             raise RuntimeError(
                 "Workspace tool-call limit exceeded for one generation."
             )

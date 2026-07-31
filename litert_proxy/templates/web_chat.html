@@ -522,6 +522,8 @@ const serverFields = [
   {id:"sReasoning", key:"reasoning_effort", label:"Reasoning effort", type:"select", options:["none","minimal","low","medium","high","xhigh"]},
   {id:"sRepPenalty", key:"repetition_penalty", label:"Repetition penalty", min:1, max:2, step:0.01, type:"number"},
   {id:"sRetries", key:"malformed_tool_call_retries", label:"Tool-call retries", min:0, max:5, type:"number"},
+  {id:"sToolArgLength", key:"max_tool_argument_string_length", label:"Max tool argument string length", min:512, type:"number"},
+  {id:"sToolCallsPerGen", key:"max_tool_calls_per_generation", label:"Max workspace tool calls per generation", min:1, max:50, type:"number"},
   {id:"sConstrained", key:"constrained_decoding", label:"Constrained decoding", type:"select", options:["true","false"]},
   {id:"sSpecDecoding", key:"speculative_decoding", label:"Speculative decoding", type:"select", options:["true","false"]},
 ];
@@ -577,7 +579,18 @@ async function loadChatDefaults() {
     const resp = await fetch("/v1/admin/config");
     if (!resp.ok) return;
     const config = await resp.json();
-    document.getElementById("effort").value = config.reasoning_effort;
+    if (config.reasoning_effort != null)
+      document.getElementById("effort").value = config.reasoning_effort;
+    if (config.default_max_output_tokens != null)
+      document.getElementById("maxTokens").value = config.default_max_output_tokens;
+    if (config.temperature != null)
+      document.getElementById("temperature").value = config.temperature;
+    if (config.top_p != null)
+      document.getElementById("topP").value = config.top_p;
+    if (config.top_k != null)
+      document.getElementById("topK").value = config.top_k;
+    if (config.repetition_penalty != null)
+      document.getElementById("repPenalty").value = config.repetition_penalty;
   } catch (_) {}
 }
 
@@ -617,7 +630,7 @@ document.getElementById("serverRestart").addEventListener("click", async () => {
     // Refresh the displayed config
     const cfg = await fetch("/v1/admin/config").then(r => r.json());
     buildGrid(cfg);
-    document.getElementById("effort").value = cfg.reasoning_effort;
+    loadChatDefaults();
   } catch (e) {
     serverStatus.textContent = "Error: " + e.message;
   } finally {

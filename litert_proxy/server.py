@@ -27,6 +27,7 @@ from .config import (
     MALFORMED_TOOL_CALL_RETRIES,
     MAX_NUM_TOKENS,
     MAX_TOOL_ARGUMENT_STRING_LENGTH,
+    MAX_TOOL_CALLS_PER_GENERATION,
     MAX_TOOL_RESPONSE_TOKENS,
     MODEL_PATH,
     MODEL_REGISTRY,
@@ -57,6 +58,9 @@ class AdminReconfigureRequest(BaseModel):
     constrained_decoding: Optional[bool] = None
     speculative_decoding: Optional[bool] = None
     malformed_tool_call_retries: Optional[int] = None
+    max_tool_argument_string_length: Optional[int] = None
+    max_tool_calls_per_generation: Optional[int] = None
+
 from .utils.message import canonical_messages
 from .utils.tools import normalize_tool_definitions
 from .utils.token import (
@@ -156,6 +160,10 @@ def _initialize_model_runtime():
     print(
         "Malformed tool-call retries: "
         f"{MALFORMED_TOOL_CALL_RETRIES}"
+    )
+    print(
+        "Max workspace tool calls per generation: "
+        f"{MAX_TOOL_CALLS_PER_GENERATION}"
     )
     print(
         "Tool constrained decoding: "
@@ -715,6 +723,8 @@ async def admin_get_config():
         "constrained_decoding": config.ENABLE_CONSTRAINED_DECODING,
         "speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
         "malformed_tool_call_retries": config.MALFORMED_TOOL_CALL_RETRIES,
+        "max_tool_argument_string_length": config.MAX_TOOL_ARGUMENT_STRING_LENGTH,
+        "max_tool_calls_per_generation": config.MAX_TOOL_CALLS_PER_GENERATION,
     }
 
 
@@ -770,6 +780,12 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
         if body.malformed_tool_call_retries is not None:
             config.MALFORMED_TOOL_CALL_RETRIES = body.malformed_tool_call_retries
             changed.append(f"malformed_tool_call_retries={body.malformed_tool_call_retries}")
+        if body.max_tool_argument_string_length is not None:
+            config.MAX_TOOL_ARGUMENT_STRING_LENGTH = body.max_tool_argument_string_length
+            changed.append(f"max_tool_argument_string_length={body.max_tool_argument_string_length}")
+        if body.max_tool_calls_per_generation is not None:
+            config.MAX_TOOL_CALLS_PER_GENERATION = body.max_tool_calls_per_generation
+            changed.append(f"max_tool_calls_per_generation={body.max_tool_calls_per_generation}")
 
         if not changed:
             return {"status": "unchanged", "changes": []}
