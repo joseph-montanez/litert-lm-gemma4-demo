@@ -49,8 +49,10 @@ class PersistentConversationWorker:
             daemon=True,
         )
         self._stop_event = threading.Event()
+        self._state_lock = threading.Lock()
         self._conversation = None
         self._active_conversation = None
+        self._pending_job: Optional[InferenceJob] = None
         self._current_job: Optional[InferenceJob] = None
 
         self._last_request_messages: list[dict[str, Any]] = []
@@ -60,24 +62,34 @@ class PersistentConversationWorker:
         self._last_response_message: Optional[dict[str, Any]] = None
         self._last_finish_reason = "stop"
         self._last_usage: dict[str, Any] = {}
+        self._context_usage: dict[str, Any] = {}
         self._config_signature: Optional[str] = None
 
     def start(self):
         self._thread.start()
 
     def submit(self, job: InferenceJob):
+        with self._state_lock:
+            self._pending_job = job
         self._jobs.put(job)
 
-    def cancel_current(self):
-        current_job = self._current_job
+    def cancel_current(self) -> bool:
+        with self._state_lock:
+            pending_job = self._pending_job
+            current_job = self._current_job
+            conversations = [
+                self._active_conversation,
+                self._conversation,
+            ]
 
-        if current_job is not None:
-            current_job.cancel_event.set()
+        cancelled = pending_job is not None or current_job is not None
+        for job in (pending_job, current_job):
+            if job is None:
+                continue
+            job.cancel_event.set()
 
-        conversations = [
-            self._active_conversation,
-            self._conversation,
-        ]
+        if current_job is None:
+            return cancelled
 
         for conversation in conversations:
             if conversation is None:
@@ -88,6 +100,8 @@ class PersistentConversationWorker:
             except Exception:
                 pass
 
+        return cancelled
+
     def stop(self):
         self._stop_event.set()
         self.cancel_current()
@@ -95,6 +109,11 @@ class PersistentConversationWorker:
         self._thread.join(timeout=10)
 
     def status(self) -> dict[str, Any]:
+        with self._state_lock:
+            pending = self._pending_job is not None
+            busy = self._current_job is not None
+            context_usage = dict(self._context_usage)
+
         return {
             "conversation_cached": self._conversation is not None,
             "active_conversation": self._active_conversation is not None,
@@ -104,7 +123,23 @@ class PersistentConversationWorker:
             "last_tool_calls": len(self._last_tool_calls),
             "tool_context_mode": config.TOOL_CONTEXT_MODE,
             "tool_chain_persistent": config.TOOL_CONTEXT_MODE == "merged",
-            "busy": self._current_job is not None,
+            "busy": pending or busy,
+            "context_tokens": int(
+                context_usage.get(
+                    "context_tokens",
+                    context_usage.get("total_tokens", 0),
+                )
+            ),
+            "context_prompt_tokens": int(
+                context_usage.get("prompt_tokens", 0)
+            ),
+            "context_generated_tokens": int(
+                context_usage.get("generated_tokens", 0)
+            ),
+            "context_reasoning_tokens": int(
+                context_usage.get("reasoning_tokens", 0)
+            ),
+            "context_estimated": True,
         }
 
     def reset(self):
@@ -118,7 +153,10 @@ class PersistentConversationWorker:
             if job is None:
                 break
 
-            self._current_job = job
+            with self._state_lock:
+                if self._pending_job is job:
+                    self._pending_job = None
+                self._current_job = job
 
             try:
                 self._process(job)
@@ -133,7 +171,9 @@ class PersistentConversationWorker:
 
                 job.result_queue.put(("error", exc))
             finally:
-                self._current_job = None
+                with self._state_lock:
+                    if self._current_job is job:
+                        self._current_job = None
 
         self._reset_conversation()
 
@@ -155,6 +195,22 @@ class PersistentConversationWorker:
         )
 
         for attempt in range(attempts):
+            if job.cancel_event.is_set():
+                job.result_queue.put(
+                    (
+                        "done",
+                        {
+                            "usage": {},
+                            "response_text": "",
+                            "reasoning_text": "",
+                            "tool_calls": [],
+                            "finish_reason": "stop",
+                            "cache_mode": "cancelled",
+                        },
+                    )
+                )
+                return
+
             try:
                 processor(job)
                 return
@@ -254,6 +310,14 @@ class PersistentConversationWorker:
             usage["cache_mode"] = "tool-separate"
             usage["cached_tokens"] = 0
             usage["prefill_tokens"] = total_tokens
+            usage["context_tokens"] = (
+                0 if state.cancelled else usage["total_tokens"]
+            )
+
+            if state.cancelled:
+                self._record_context_usage()
+            else:
+                self._record_context_usage(usage)
 
             job.result_queue.put(
                 (
@@ -283,6 +347,7 @@ class PersistentConversationWorker:
             job.messages,
             config_signature,
         )
+        previous_context_tokens = self._context_token_count()
 
         if plan.mode == "replay":
             if self._last_reasoning_text:
@@ -388,6 +453,16 @@ class PersistentConversationWorker:
             usage = progress.finish(
                 "cancelled" if state.cancelled else "done"
             )
+            if state.cancelled:
+                usage["context_tokens"] = 0
+            elif plan.mode == "reuse":
+                usage["context_tokens"] = (
+                    previous_context_tokens
+                    + plan.prefill_tokens
+                    + usage.get("generated_tokens", 0)
+                )
+            else:
+                usage["context_tokens"] = usage["total_tokens"]
 
             response_message: dict[str, Any] = {
                 "role": "assistant",
@@ -410,6 +485,7 @@ class PersistentConversationWorker:
                 self._last_response_message = response_message
                 self._last_finish_reason = finish_reason
                 self._last_usage = usage
+                self._record_context_usage(usage)
                 self._config_signature = config_signature
 
             job.result_queue.put(
@@ -543,4 +619,21 @@ class PersistentConversationWorker:
         self._last_response_message = None
         self._last_finish_reason = "stop"
         self._last_usage = {}
+        self._record_context_usage()
         self._config_signature = None
+
+    def _record_context_usage(
+        self,
+        usage: Optional[dict[str, Any]] = None,
+    ):
+        with self._state_lock:
+            self._context_usage = dict(usage or {})
+
+    def _context_token_count(self) -> int:
+        with self._state_lock:
+            return int(
+                self._context_usage.get(
+                    "context_tokens",
+                    self._context_usage.get("total_tokens", 0),
+                )
+            )

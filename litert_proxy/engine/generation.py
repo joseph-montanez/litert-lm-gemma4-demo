@@ -95,6 +95,10 @@ def generation_events(
     cancel_event: threading.Event,
     state: GenerationState,
 ) -> Iterator[tuple[str, Any]]:
+    if cancel_event.is_set():
+        state.cancelled = True
+        return
+
     tool_event_handler = getattr(
         conversation,
         "tool_event_handler",

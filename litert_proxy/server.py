@@ -364,6 +364,20 @@ async def reset_conversation():
         _request_lock.release()
 
 
+@app.post("/v1/conversation/cancel")
+async def cancel_conversation():
+    if conversation_worker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not loaded.",
+        )
+
+    cancelled = conversation_worker.cancel_current()
+    return {
+        "status": "cancelling" if cancelled else "idle",
+    }
+
+
 @app.get("/v1/workspace/shell-approvals/{approval_session_id}")
 async def get_shell_approval(approval_session_id: str):
     """Return the command currently waiting on this approval session."""
@@ -576,7 +590,7 @@ async def chat_completions(
         raise
 
     if request.stream:
-        def stream_generator():
+        async def stream_generator():
             completed = False
 
             try:
@@ -584,8 +598,10 @@ async def chat_completions(
 
                 while True:
                     try:
-                        event, payload = result_queue.get(
-                            timeout=SSE_HEARTBEAT_SECONDS
+                        event, payload = await asyncio.to_thread(
+                            result_queue.get,
+                            True,
+                            SSE_HEARTBEAT_SECONDS,
                         )
                     except queue.Empty:
                         yield (

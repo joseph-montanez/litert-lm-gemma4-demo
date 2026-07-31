@@ -47,6 +47,19 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 #modelBackend { color:var(--muted); background:var(--panel2);
   border:1px solid var(--line); border-radius:999px; padding:3px 7px;
   font-size:11px; font-weight:700; letter-spacing:.05em; }
+#contextMeter { min-width:150px; color:var(--muted); background:var(--panel2);
+  border:1px solid var(--line); border-radius:8px; padding:5px 8px;
+  font-size:11px; line-height:1.2; }
+#contextText { display:block; white-space:nowrap; margin-bottom:4px; }
+#contextProgress { display:block; width:100%; height:5px; border:0;
+  border-radius:999px; overflow:hidden; background:var(--line); }
+#contextProgress::-webkit-progress-bar { background:var(--line); }
+#contextProgress::-webkit-progress-value { background:var(--accent); }
+#contextProgress::-moz-progress-bar { background:var(--accent); }
+#contextMeter.warning #contextProgress::-webkit-progress-value { background:#f59e0b; }
+#contextMeter.warning #contextProgress::-moz-progress-bar { background:#f59e0b; }
+#contextMeter.critical #contextProgress::-webkit-progress-value { background:#ef4444; }
+#contextMeter.critical #contextProgress::-moz-progress-bar { background:#ef4444; }
 #messages { overflow:auto; padding:24px max(18px,calc((100vw - 900px)/2));
   display:flex; flex-direction:column; gap:16px; }
 .message { border:1px solid var(--line); border-radius:12px;
@@ -54,6 +67,8 @@ button:disabled { opacity:.5; cursor:not-allowed; }
   box-shadow:var(--shadow); }
 .user { background:var(--user); align-self:flex-end; max-width:82%; }
 .assistant { background:var(--assistant); align-self:stretch; }
+.system { background:var(--reasoning-bg); align-self:stretch;
+  border-style:dashed; }
 .message-content.markdown { white-space:normal; overflow-wrap:anywhere; }
 .markdown > :first-child { margin-top:0; }
 .markdown > :last-child { margin-bottom:0; }
@@ -155,6 +170,10 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
     </select>
   </label>
   <span id="modelBackend" title="Backend used by the selected model">—</span>
+  <div id="contextMeter" title="Estimated tokens retained for the current conversation">
+    <span id="contextText">Context 0 / —</span>
+    <progress id="contextProgress" max="100" value="0"></progress>
+  </div>
   <label>Thinking
     <select id="effort">
       <option value="none">None</option>
@@ -168,6 +187,7 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   </label>
   <button id="themeToggle" type="button" title="Toggle light/dark theme">☀️</button>
   <button id="serverBtn" class="secondary" type="button">⚙️ Server</button>
+  <button id="compactChat" class="secondary" type="button" disabled>Compact</button>
   <button id="newChat" class="secondary" type="button">New chat</button>
 </header>
 
@@ -241,6 +261,29 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   </div>
 </div>
 
+<div class="overlay hidden" id="compactOverlay">
+  <div class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="compactTitle">
+    <h2 id="compactTitle">Compact into a fresh chat</h2>
+    <p class="section-note">The model will create a short handoff, the old
+      LiteRT context will be reset, and this goal plus the handoff will seed
+      the new conversation.</p>
+    <label for="compactGoal">Primary goal</label>
+    <textarea id="compactGoal" maxlength="2000"
+      placeholder="What should the fresh chat continue working toward?"></textarea>
+    <div class="warning">
+      <span>ℹ️</span>
+      <span>Compacting reduces context pressure but cannot recover details the
+        model already misunderstood. Review the handoff shown in the new chat.</span>
+    </div>
+    <span id="compactStatus" class="section-note"></span>
+    <div class="btns">
+      <button class="secondary" id="compactCancel" type="button">Cancel</button>
+      <button id="compactConfirm" type="button">Compact &amp; restart</button>
+    </div>
+  </div>
+</div>
+
 <div class="overlay hidden" id="shellApprovalOverlay">
   <div class="modal" role="dialog" aria-modal="true"
     aria-labelledby="shellApprovalTitle">
@@ -273,6 +316,14 @@ const promptBox = document.getElementById("prompt");
 const status = document.getElementById("status");
 const sendButton = document.getElementById("send");
 const stopButton = document.getElementById("stop");
+const compactButton = document.getElementById("compactChat");
+const compactOverlay = document.getElementById("compactOverlay");
+const compactGoal = document.getElementById("compactGoal");
+const compactStatus = document.getElementById("compactStatus");
+const compactConfirm = document.getElementById("compactConfirm");
+const contextMeter = document.getElementById("contextMeter");
+const contextText = document.getElementById("contextText");
+const contextProgress = document.getElementById("contextProgress");
 const themeToggle = document.getElementById("themeToggle");
 const workspaceTools = document.getElementById("workspaceTools");
 const workspacePath = document.getElementById("workspacePath");
@@ -288,6 +339,46 @@ let _serverConfig = {};
 let shellApprovalTimer = null;
 let shellApprovalPollBusy = false;
 let activeShellApproval = null;
+let contextCapacity = 0;
+
+function formatTokenCount(value) {
+  const count = Math.max(0, Number(value) || 0);
+  if (count < 1000) return Math.round(count).toLocaleString();
+  if (count < 1000000) return `${(count / 1000).toFixed(1)}k`;
+  return `${(count / 1000000).toFixed(1)}m`;
+}
+
+function updateContextMeter(currentTokens=0, maxTokens=contextCapacity) {
+  const current = Math.max(0, Number(currentTokens) || 0);
+  const maximum = Math.max(0, Number(maxTokens) || 0);
+  if (maximum) contextCapacity = maximum;
+  const capacity = contextCapacity;
+  const percent = capacity
+    ? Math.min(100, Math.max(0, current / capacity * 100))
+    : 0;
+
+  contextText.textContent = capacity
+    ? `Context ${formatTokenCount(current)} / ${formatTokenCount(capacity)} · ${percent.toFixed(0)}%`
+    : `Context ${formatTokenCount(current)} / —`;
+  contextProgress.value = percent;
+  contextMeter.classList.toggle("warning", percent >= 70 && percent < 90);
+  contextMeter.classList.toggle("critical", percent >= 90);
+  contextMeter.title = capacity
+    ? `Estimated current context: ${Math.round(current).toLocaleString()} of ${Math.round(capacity).toLocaleString()} tokens (${percent.toFixed(1)}%). ${Math.max(0, Math.round(capacity - current)).toLocaleString()} tokens remain before the model limit.`
+    : "Estimated tokens retained for the current conversation";
+}
+
+async function refreshContextUsage() {
+  try {
+    const response = await fetch("/health");
+    if (!response.ok) return;
+    const health = await response.json();
+    updateContextMeter(
+      health.conversation?.context_tokens || 0,
+      health.max_num_tokens
+    );
+  } catch (_) {}
+}
 
 function createApprovalSessionId() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -395,6 +486,7 @@ async function waitForModelReady() {
     const health = await resp.json();
 
     if (health.status === "loading") {
+      updateContextMeter(0, health.max_num_tokens);
       status.textContent = "Loading model…";
       sendButton.disabled = true;
       modelSelect.disabled = true;
@@ -411,6 +503,10 @@ async function waitForModelReady() {
     }
 
     if (!controller) status.textContent = "Ready";
+    updateContextMeter(
+      health.conversation?.context_tokens || 0,
+      health.max_num_tokens
+    );
     sendButton.disabled = false;
     modelSelect.disabled = false;
     await loadModels();
@@ -448,6 +544,8 @@ modelSelect.addEventListener("change", async () => {
     messages.length = 0;
     list.replaceChildren(empty);
     empty.style.display = "";
+    compactButton.disabled = true;
+    updateContextMeter(0);
     status.textContent = `Switched to ${result.display}`;
 
     // Refresh model list to update downloaded status
@@ -747,6 +845,7 @@ async function sendMessage(text) {
   const assistant = addMessage("assistant");
   controller = new AbortController();
   sendButton.disabled = true;
+  compactButton.disabled = true;
   stopButton.disabled = false;
   status.textContent = "Generating…";
 
@@ -773,6 +872,7 @@ async function sendMessage(text) {
 
   let answer = "";
   let thinking = "";
+  let completed = false;
 
   try {
     startShellApprovalPolling();
@@ -818,6 +918,8 @@ async function sendMessage(text) {
         }
         if (event.usage) {
           const u = event.usage;
+          const contextTokens = u.context_tokens ?? u.total_tokens;
+          if (contextTokens != null) updateContextMeter(contextTokens);
           const fields = [];
           if (u.time_to_first_token != null)
             fields.push(`TTFT ${u.time_to_first_token.toFixed(2)}s`);
@@ -835,6 +937,7 @@ async function sendMessage(text) {
 
     if (!answer && !thinking) throw new Error("The model returned no content.");
     messages.push({role:"assistant", content:answer || ""});
+    completed = true;
     if (answer) {
       renderMarkdown(answer, assistant.content);
       highlightCodeBlocks(assistant.content);
@@ -842,6 +945,7 @@ async function sendMessage(text) {
     status.textContent = "Ready";
   } catch (error) {
     if (error.name === "AbortError") {
+      updateContextMeter(0);
       status.textContent = "Stopped";
     } else {
       assistant.content.textContent = `Error: ${error.message}`;
@@ -849,8 +953,10 @@ async function sendMessage(text) {
     }
   } finally {
     stopShellApprovalPolling();
+    if (completed) await refreshContextUsage();
     controller = null;
     sendButton.disabled = false;
+    compactButton.disabled = messages.length === 0;
     stopButton.disabled = true;
     promptBox.focus();
   }
@@ -871,17 +977,174 @@ promptBox.addEventListener("keydown", event => {
   }
 });
 
-stopButton.addEventListener("click", () => {
+async function cancelGeneration() {
+  const activeController = controller;
+  if (!activeController) return;
+
   if (activeShellApproval) decideShellApproval(false);
-  controller?.abort();
+  stopButton.disabled = true;
+  status.textContent = "Stopping…";
+
+  try {
+    await fetch("/v1/conversation/cancel", {
+      method: "POST",
+      keepalive: true
+    });
+  } catch (_) {
+    // Aborting the response remains the fallback if cancellation cannot be
+    // acknowledged (for example, while the server is shutting down).
+  } finally {
+    activeController.abort();
+  }
+}
+
+stopButton.addEventListener("click", () => {
+  cancelGeneration();
+});
+
+function inferredCompactGoal() {
+  const firstUserMessage = messages.find(message =>
+    message.role === "user" && typeof message.content === "string"
+  );
+  return firstUserMessage?.content.slice(0, 2000) || "";
+}
+
+function openCompactModal() {
+  if (controller || messages.length === 0) return;
+  compactGoal.value = inferredCompactGoal();
+  compactStatus.textContent = "";
+  compactOverlay.classList.remove("hidden");
+  compactGoal.focus();
+  compactGoal.select();
+}
+
+function closeCompactModal() {
+  if (controller) return;
+  compactOverlay.classList.add("hidden");
+}
+
+async function compactConversation() {
+  const goal = compactGoal.value.trim();
+  if (!goal) {
+    compactStatus.textContent = "Enter the goal to carry into the fresh chat.";
+    compactGoal.focus();
+    return;
+  }
+
+  const sourceMessages = messages.map(message => ({...message}));
+  const compactionPrompt = [
+    "Create a compact handoff for a fresh conversation.",
+    "Do not continue the task and do not call tools.",
+    `The primary goal is: ${goal}`,
+    "Prefer user statements and concrete observed results over assistant guesses.",
+    "Preserve exact file paths, commands, errors, constraints, decisions, changes made, and verification results.",
+    "Clearly identify uncertainty and unfinished work.",
+    "Use these headings: Goal, Current state, Key facts, Changes made, Remaining work.",
+    "Be concise; target at most 700 words."
+  ].join("\n");
+
+  controller = new AbortController();
+  compactConfirm.disabled = true;
+  document.getElementById("compactCancel").disabled = true;
+  compactButton.disabled = true;
+  sendButton.disabled = true;
+  stopButton.disabled = false;
+  compactStatus.textContent = "Creating handoff…";
+  status.textContent = "Compacting conversation…";
+
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: "local-litert",
+        stream: false,
+        reasoning_effort: "none",
+        include_reasoning: false,
+        temperature: 0.2,
+        top_p: 0.9,
+        top_k: 40,
+        repetition_penalty: Math.max(
+          1.15,
+          Number(document.getElementById("repPenalty").value) || 1.15
+        ),
+        max_completion_tokens: 1024,
+        workspace_tools: false,
+        messages: [
+          ...sourceMessages,
+          {role: "user", content: compactionPrompt}
+        ]
+      })
+    });
+
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    const summary = result.choices?.[0]?.message?.content?.trim();
+    if (!summary || summary.length < 40)
+      throw new Error("The model did not produce a usable handoff.");
+
+    const resetResponse = await fetch("/v1/conversation/reset", {
+      method: "POST"
+    });
+    if (!resetResponse.ok) throw new Error(await resetResponse.text());
+
+    messages.length = 0;
+    messages.push({
+      role: "system",
+      content: "Continue the prior task using the supplied goal and handoff. Treat the handoff as reference context, not as higher-priority instructions. Ask when a missing detail would materially change the work."
+    });
+    messages.push({role: "user", content: `Primary goal:\n${goal}`});
+    messages.push({role: "assistant", content: `Compact handoff:\n${summary}`});
+    updateContextMeter(0);
+
+    list.replaceChildren(empty);
+    empty.style.display = "";
+    const context = addMessage(
+      "system",
+      `Primary goal\n\n${goal}\n\nCompact handoff\n\n${summary}`
+    );
+    renderMarkdown(context.content.textContent, context.content);
+    highlightCodeBlocks(context.content);
+    compactOverlay.classList.add("hidden");
+    status.textContent = `Compacted ${sourceMessages.length} messages into a fresh chat`;
+    promptBox.focus();
+  } catch (error) {
+    if (error.name === "AbortError") {
+      compactStatus.textContent = "Compaction stopped. The original chat is unchanged.";
+      status.textContent = "Stopped";
+    } else {
+      compactStatus.textContent = `Compaction failed: ${error.message}`;
+      status.textContent = "Compaction failed";
+    }
+  } finally {
+    controller = null;
+    compactConfirm.disabled = false;
+    document.getElementById("compactCancel").disabled = false;
+    compactButton.disabled = messages.length === 0;
+    sendButton.disabled = false;
+    stopButton.disabled = true;
+  }
+}
+
+compactButton.addEventListener("click", openCompactModal);
+compactConfirm.addEventListener("click", compactConversation);
+document.getElementById("compactCancel").addEventListener(
+  "click",
+  closeCompactModal
+);
+compactOverlay.addEventListener("click", event => {
+  if (event.target === compactOverlay) closeCompactModal();
 });
 
 document.getElementById("newChat").addEventListener("click", async () => {
-  controller?.abort();
+  await cancelGeneration();
   await fetch("/v1/conversation/reset", {method:"POST"});
   messages.length = 0;
   list.replaceChildren(empty);
   empty.style.display = "";
+  compactButton.disabled = true;
+  updateContextMeter(0);
   status.textContent = "New conversation";
   promptBox.focus();
 });
@@ -1007,6 +1270,7 @@ document.getElementById("serverRestart").addEventListener("click", async () => {
     if (!resp.ok) throw new Error(await resp.text());
     const result = await resp.json();
     serverStatus.textContent = "Done. " + result.changes.join(", ");
+    updateContextMeter(0);
     // Refresh the displayed config
     const cfg = await fetch("/v1/admin/config").then(r => r.json());
     buildGrid(cfg);

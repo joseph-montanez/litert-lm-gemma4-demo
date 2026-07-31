@@ -2,14 +2,48 @@ import asyncio
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from litert_proxy import config
 from litert_proxy import server
+from litert_proxy.models import ChatCompletionRequest
 from litert_proxy.workspace_tools import ShellApprovalBroker
 
 
 class ServerStartupTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_endpoint_cancels_active_generation(self):
+        worker = Mock()
+        worker.cancel_current.return_value = True
+
+        with patch.object(server, "conversation_worker", worker):
+            response = await server.cancel_conversation()
+
+        self.assertEqual(response, {"status": "cancelling"})
+        worker.cancel_current.assert_called_once_with()
+
+    async def test_closing_stream_cancels_backend_job(self):
+        worker = Mock()
+        request = ChatCompletionRequest(
+            stream=True,
+            messages=[{"role": "user", "content": "keep going"}],
+        )
+
+        with (
+            patch.object(server, "engine", object()),
+            patch.object(server, "conversation_worker", worker),
+        ):
+            response = await server.chat_completions(request)
+            stream = response.body_iterator
+            await anext(stream)
+            await stream.aclose()
+
+        job = worker.submit.call_args.args[0]
+        self.assertTrue(job.cancel_event.is_set())
+        worker.cancel_current.assert_called_once_with()
+
+        self.assertTrue(server._request_lock.acquire(blocking=False))
+        server._request_lock.release()
+
     async def test_shell_approval_endpoints_resolve_waiting_command(self):
         broker = ShellApprovalBroker()
         result = []
@@ -56,6 +90,20 @@ class ServerStartupTest(unittest.IsolatedAsyncioTestCase):
             "application/javascript",
         )
         self.assertIn("immutable", response.headers["cache-control"])
+
+    async def test_web_chat_exposes_fresh_chat_compaction(self):
+        server._web_chat_html = ""
+
+        with patch.object(config, "WEB_UI_ENABLED", True):
+            response = await server.web_chat()
+
+        html = response.body.decode("utf-8")
+        self.assertIn('id="compactChat"', html)
+        self.assertIn('id="compactGoal"', html)
+        self.assertIn('id="contextMeter"', html)
+        self.assertIn('id="contextProgress"', html)
+        self.assertIn("Create a compact handoff for a fresh conversation", html)
+        self.assertIn('fetch("/v1/conversation/reset"', html)
 
     async def test_lifespan_serves_while_model_loads(self):
         started = threading.Event()

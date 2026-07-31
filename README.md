@@ -610,6 +610,15 @@ Native workspace tools cannot be combined with client-supplied OpenAI `tools`
 in one request. The former execute inside LiteRT-LM; the latter are returned to
 the API client for execution.
 
+### Compacting a long web chat
+
+Use **Compact** in the web chat header when a long conversation begins to lose
+coherence. Enter or revise the primary goal, then choose **Compact & restart**.
+The model creates a concise handoff with the goal, current state, key facts,
+changes, and remaining work. The server resets the old LiteRT conversation and
+seeds a fresh one with the goal and handoff. The original chat is left unchanged
+if summarization or reset fails.
+
 ## Endpoints
 
 ### `GET /health`
@@ -624,6 +633,12 @@ Returns:
 - selected tool-context mode
 - current conversation-cache status
 - malformed-call safeguards
+- estimated current conversation tokens, including prompt and generated tokens
+
+The built-in web chat displays this estimate as a **Context** meter against the
+loaded model's token capacity. It updates from the final usage event after each
+generation and resets when the conversation or engine is reset. Yellow begins
+at 70% utilization and red at 90%.
 
 ### `GET /v1/models`
 
@@ -632,6 +647,10 @@ Returns one OpenAI-style model entry derived from the loaded model filename.
 ### `POST /v1/chat/completions`
 
 OpenAI-style chat-completion endpoint supporting normal responses, SSE streaming, function tools, and tool-result continuation.
+
+### `POST /v1/conversation/cancel`
+
+Cancels the active or queued inference request and interrupts the LiteRT conversation. The built-in web chat calls this endpoint before closing its response stream when **Stop** is pressed.
 
 ### `GET /docs`
 
