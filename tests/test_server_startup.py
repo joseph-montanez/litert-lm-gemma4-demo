@@ -103,6 +103,9 @@ class ServerStartupTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="contextMeter"', html)
         self.assertIn('id="contextProgress"', html)
         self.assertIn("Create a compact handoff for a fresh conversation", html)
+        self.assertIn("Continue from the compact handoff", html)
+        self.assertIn("isNearMessageBottom", html)
+        self.assertIn("BOTTOM_FOLLOW_THRESHOLD", html)
         self.assertIn('fetch("/v1/conversation/reset"', html)
 
     async def test_lifespan_serves_while_model_loads(self):

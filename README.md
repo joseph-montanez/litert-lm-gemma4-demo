@@ -616,8 +616,13 @@ Use **Compact** in the web chat header when a long conversation begins to lose
 coherence. Enter or revise the primary goal, then choose **Compact & restart**.
 The model creates a concise handoff with the goal, current state, key facts,
 changes, and remaining work. The server resets the old LiteRT conversation and
-seeds a fresh one with the goal and handoff. The original chat is left unchanged
+seeds a fresh one with the goal and handoff, then automatically asks the model
+to continue with the next unfinished step. The original chat is left unchanged
 if summarization or reset fails.
+
+While a response streams, the message view follows new output only while the
+view is already near the bottom. Scrolling upward pauses automatic scrolling;
+scrolling back to the bottom resumes it.
 
 ## Endpoints
 

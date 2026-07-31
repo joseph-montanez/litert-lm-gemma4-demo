@@ -340,6 +340,23 @@ let shellApprovalTimer = null;
 let shellApprovalPollBusy = false;
 let activeShellApproval = null;
 let contextCapacity = 0;
+let followOutput = true;
+const BOTTOM_FOLLOW_THRESHOLD = 48;
+
+function isNearMessageBottom() {
+  return list.scrollHeight - list.scrollTop - list.clientHeight
+    <= BOTTOM_FOLLOW_THRESHOLD;
+}
+
+function scrollMessagesToBottom(force=false) {
+  if (!force && !followOutput) return;
+  list.scrollTop = list.scrollHeight;
+  followOutput = true;
+}
+
+list.addEventListener("scroll", () => {
+  followOutput = isNearMessageBottom();
+});
 
 function formatTokenCount(value) {
   const count = Math.max(0, Number(value) || 0);
@@ -544,6 +561,7 @@ modelSelect.addEventListener("change", async () => {
     messages.length = 0;
     list.replaceChildren(empty);
     empty.style.display = "";
+    followOutput = true;
     compactButton.disabled = true;
     updateContextMeter(0);
     status.textContent = `Switched to ${result.display}`;
@@ -588,7 +606,7 @@ function addMessage(role, text="") {
   metrics.className = "metrics";
   box.append(roleEl, reasoning, content, metrics);
   list.appendChild(box);
-  list.scrollTop = list.scrollHeight;
+  scrollMessagesToBottom();
   return {box, content, reasoning, reasoningText, metrics};
 }
 
@@ -839,6 +857,7 @@ shellApproveButton.addEventListener("click", () => decideShellApproval(true));
 shellDenyButton.addEventListener("click", () => decideShellApproval(false));
 
 async function sendMessage(text) {
+  followOutput = true;
   const user = {role:"user", content:text};
   messages.push(user);
   addMessage("user", text);
@@ -931,7 +950,7 @@ async function sendMessage(text) {
             fields.push(`thinking ${u.reasoning_tokens} tok`);
           assistant.metrics.textContent = fields.join(" · ");
         }
-        list.scrollTop = list.scrollHeight;
+        scrollMessagesToBottom();
       }
     }
 
@@ -941,6 +960,7 @@ async function sendMessage(text) {
     if (answer) {
       renderMarkdown(answer, assistant.content);
       highlightCodeBlocks(assistant.content);
+      scrollMessagesToBottom();
     }
     status.textContent = "Ready";
   } catch (error) {
@@ -1032,6 +1052,7 @@ async function compactConversation() {
   }
 
   const sourceMessages = messages.map(message => ({...message}));
+  let continueAfterCompact = false;
   const compactionPrompt = [
     "Create a compact handoff for a fresh conversation.",
     "Do not continue the task and do not call tools.",
@@ -1100,6 +1121,7 @@ async function compactConversation() {
 
     list.replaceChildren(empty);
     empty.style.display = "";
+    followOutput = true;
     const context = addMessage(
       "system",
       `Primary goal\n\n${goal}\n\nCompact handoff\n\n${summary}`
@@ -1107,8 +1129,8 @@ async function compactConversation() {
     renderMarkdown(context.content.textContent, context.content);
     highlightCodeBlocks(context.content);
     compactOverlay.classList.add("hidden");
-    status.textContent = `Compacted ${sourceMessages.length} messages into a fresh chat`;
-    promptBox.focus();
+    status.textContent = `Compacted ${sourceMessages.length} messages; continuing…`;
+    continueAfterCompact = true;
   } catch (error) {
     if (error.name === "AbortError") {
       compactStatus.textContent = "Compaction stopped. The original chat is unchanged.";
@@ -1124,6 +1146,12 @@ async function compactConversation() {
     compactButton.disabled = messages.length === 0;
     sendButton.disabled = false;
     stopButton.disabled = true;
+  }
+
+  if (continueAfterCompact) {
+    sendMessage(
+      "Continue from the compact handoff. Work on the next unfinished step toward the primary goal."
+    );
   }
 }
 
@@ -1143,6 +1171,7 @@ document.getElementById("newChat").addEventListener("click", async () => {
   messages.length = 0;
   list.replaceChildren(empty);
   empty.style.display = "";
+  followOutput = true;
   compactButton.disabled = true;
   updateContextMeter(0);
   status.textContent = "New conversation";
