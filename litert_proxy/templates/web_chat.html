@@ -220,11 +220,11 @@ async function sendMessage(text) {
   stopButton.disabled = false;
   status.textContent = "Generating…";
 
+  const effort = document.getElementById("effort").value;
   const body = {
     model: "local-litert",
     stream: true,
-    include_reasoning: true,
-    reasoning_effort: document.getElementById("effort").value,
+    reasoning_effort: effort,
     temperature: Number(document.getElementById("temperature").value),
     max_completion_tokens: Number(document.getElementById("maxTokens").value),
     top_p: Number(document.getElementById("topP").value),

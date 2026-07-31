@@ -295,11 +295,7 @@ def build_conversation_kwargs(
     ):
         kwargs["thinking_config"] = native_thinking_config
 
-    if (
-        not tool_definitions
-        and enabled
-        and "filter_channel_content_from_kv_cache" in parameters
-    ):
+    if "filter_channel_content_from_kv_cache" in parameters:
         kwargs["filter_channel_content_from_kv_cache"] = True
 
     with _console_lock:
