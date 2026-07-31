@@ -494,8 +494,9 @@ Supported message fields:
 | `tool_choice` | string or object | `"none"` removes all tools. A named OpenAI function choice filters the available tools to that name. Other values behave like automatic selection. |
 | `parallel_tool_calls` | any | Accepted and included in conversation-cache identity, but the server does not independently implement parallel tool execution. The client executes returned calls. |
 | `workspace_tools` | boolean | Default `false`. Registers native LiteRT-LM filesystem tools that the model executes automatically. |
-| `workspace_path` | string or null | Folder that bounds every native workspace-tool operation. Required when `workspace_tools` is true. |
-| `workspace_read_only` | boolean | Default `true`. When true, the `write` tool is not registered. |
+| `workspace_path` | string or null | Folder that bounds path-based tools and becomes the shell working directory. It is not a shell sandbox. Required when `workspace_tools` is true. |
+| `workspace_read_only` | boolean | Default `true`. When true, `write`, `edit`, and `shell` are not registered. |
+| `workspace_shell_approval_id` | string or null | Opaque client-generated ID used to retrieve and decide per-command shell approvals. Shell calls without one are denied. |
 
 ### Request example
 
@@ -562,20 +563,30 @@ The built-in web chat has a **Workspace tools** control above the prompt. Enter
 an absolute folder path and leave **Read only** enabled to give the model these
 automatically executed LiteRT-LM tools:
 
-- `list`: list files and directories
-- `glob`: find paths by glob pattern
+- `find`: find files and directories by path or glob pattern
 - `grep`: search text files with a regular expression
 - `read`: read bounded line ranges from UTF-8 text files
 - `line_count`: count the lines in a UTF-8 text file
+- `size`, `sort`, `head`, `tail`, and `platform`: bounded inspection helpers
 
-Disabling **Read only** also registers `write`, which can create, overwrite, or
-append to files whose parent directory already exists. Read-only enforcement is
-structural: the write tool is omitted from the conversation rather than merely
-described as unavailable.
+Disabling **Read only** also registers `write`, `edit`, and `shell`. The web chat
+requires a separate approval for every shell command and displays the exact
+command and working directory before execution. Closing or stopping the request
+denies a pending command; unanswered approvals expire after five minutes. A
+working directory is not a process sandbox, so an approved shell command can
+still access parent or absolute paths with the server user's permissions.
 
-All tool paths are resolved against the selected folder. Parent traversal and
-symlinks that escape that folder are rejected. Reads, searches, result counts,
-and writes are bounded to protect the model context and server process.
+API clients must generate a hard-to-guess `workspace_shell_approval_id`, poll
+`GET /v1/workspace/shell-approvals/{approval_id}`, and decide a pending call with
+`POST /v1/workspace/shell-approvals/{approval_id}/{call_id}` using
+`{"approved": true}` or `{"approved": false}`. Without an approval ID, shell
+calls are denied rather than executed.
+
+Paths handled by the filesystem tools are resolved against the selected folder.
+Parent traversal and symlinks that escape that folder are rejected. Reads,
+searches, result counts, and writes are bounded to protect the model context and
+server process. Approved shell commands are the exception: the selected folder
+is only their initial working directory.
 
 API example:
 

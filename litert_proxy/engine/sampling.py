@@ -301,7 +301,10 @@ def build_conversation_kwargs(
         kwargs["automatic_tool_calling"] = bool(native_workspace_tools)
 
     if native_workspace_tools and "tool_event_handler" in parameters:
-        kwargs["tool_event_handler"] = WorkspaceToolEventHandler()
+        kwargs["tool_event_handler"] = WorkspaceToolEventHandler(
+            workspace_root=root,
+            shell_approval_id=request.workspace_shell_approval_id,
+        )
 
     if (
         (tool_definitions or native_workspace_tools)

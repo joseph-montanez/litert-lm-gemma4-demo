@@ -25,16 +25,23 @@ MODEL_REGISTRY = {
         "repo": "litert-community/gemma-4-E2B-it-litert-lm",
         "filename": "gemma-4-E2B-it.litertlm",
         "display": "Gemma 4 E2B (2B)",
+        "backend": "gpu",
     },
     "gemma-4-E4B-it": {
         "repo": "litert-community/gemma-4-E4B-it-litert-lm",
         "filename": "gemma-4-E4B-it.litertlm",
         "display": "Gemma 4 E4B (4B)",
+        "backend": "gpu",
     },
     "gemma-4-12B-it": {
         "repo": "litert-community/gemma-4-12B-it-litert-lm",
         "filename": "gemma-4-12B-it.litertlm",
         "display": "Gemma 4 12B",
+        # The published desktop bundle declares a GPU main-backend
+        # constraint; no CPU variant is currently available.
+        "backend": "gpu",
+        "max_num_tokens": 32768,
+        "default_max_output_tokens": 4096,
     },
 }
 
@@ -43,27 +50,27 @@ CURRENT_MODEL_KEY: str | None = None
 
 # Directory where registry models are stored.
 _MODELS_DIR = os.path.join(os.path.expanduser("~"), ".litert-lm", "models")
-MAX_NUM_TOKENS = int(os.environ.get("LITERT_MAX_NUM_TOKENS", "32768"))
+MAX_NUM_TOKENS = int(os.environ.get("LITERT_MAX_NUM_TOKENS", "131072"))
 DEFAULT_MAX_OUTPUT_TOKENS = int(
-    os.environ.get("LITERT_MAX_OUTPUT_TOKENS", "4096")
+    os.environ.get("LITERT_MAX_OUTPUT_TOKENS", "32768")
 )
 MAX_TOOL_RESPONSE_TOKENS = int(
-    os.environ.get("LITERT_MAX_TOOL_RESPONSE_TOKENS", "4096")
+    os.environ.get("LITERT_MAX_TOOL_RESPONSE_TOKENS", "32768")
 )
 CONTEXT_SAFETY_MARGIN_TOKENS = int(
     os.environ.get("LITERT_CONTEXT_SAFETY_MARGIN", "1024")
 )
 INFERENCE_TIMEOUT_SECONDS = float(
-    os.environ.get("LITERT_INFERENCE_TIMEOUT", "180")
+    os.environ.get("LITERT_INFERENCE_TIMEOUT", "600")
 )
 MALFORMED_TOOL_CALL_RETRIES = int(
-    os.environ.get("LITERT_MALFORMED_TOOL_RETRIES", "1")
+    os.environ.get("LITERT_MALFORMED_TOOL_RETRIES", "6")
 )
 MAX_TOOL_ARGUMENT_STRING_LENGTH = int(
     os.environ.get("LITERT_MAX_TOOL_ARGUMENT_LENGTH", "16384")
 )
 MAX_TOOL_CALLS_PER_GENERATION = int(
-    os.environ.get("LITERT_MAX_TOOL_CALLS_PER_GENERATION", "6")
+    os.environ.get("LITERT_MAX_TOOL_CALLS_PER_GENERATION", "100")
 )
 CACHE_DIR = os.environ.get(
     "LITERT_CACHE_DIR",
@@ -73,6 +80,10 @@ CACHE_DIR = os.environ.get(
 DEFAULT_TEMPERATURE = float(
     os.environ.get("LITERT_TEMPERATURE", "1.0")
 )
+DEFAULT_BACKEND = os.environ.get(
+    "LITERT_BACKEND",
+    "gpu",
+).strip().lower()
 DEFAULT_REASONING_EFFORT = os.environ.get(
     "LITERT_REASONING_EFFORT",
     "high",
@@ -84,6 +95,7 @@ THINKING_TOKEN_BUDGETS = {
     "medium": 1024,
     "high": 2048,
     "xhigh": 4096,
+    "max": 32768,
 }
 DEFAULT_TOOL_TEMPERATURE = float(
     os.environ.get("LITERT_TOOL_TEMPERATURE", "0.6")
@@ -172,6 +184,45 @@ def _download_model(repo_id: str, filename: str, dest: Path) -> str:
 
     print(f"Model downloaded to: {dest}")
     return str(dest)
+
+
+BACKEND_MAP = {
+    "gpu": "GPU",
+    "cpu": "CPU",
+    "npu": "NPU",
+}
+
+
+def resolve_backend(
+    model_key: str | None = None,
+    request_backend: str | None = None,
+):
+    """Resolve litert_lm Backend from model registry, request, or default.
+
+    Priority: request > model registry entry > DEFAULT_BACKEND env.
+    Returns a litert_lm.Backend instance.
+    """
+    import litert_lm
+
+    backend_str = None
+
+    if request_backend is not None:
+        backend_str = request_backend.strip().lower()
+    elif model_key is not None and model_key in MODEL_REGISTRY:
+        backend_str = MODEL_REGISTRY[model_key].get(
+            "backend", DEFAULT_BACKEND
+        )
+    else:
+        backend_str = DEFAULT_BACKEND
+
+    if backend_str not in BACKEND_MAP:
+        raise ValueError(
+            f"Unknown backend: {backend_str!r}. "
+            f"Must be one of: {', '.join(BACKEND_MAP.keys())}"
+        )
+
+    backend_class = getattr(litert_lm.Backend, BACKEND_MAP[backend_str])
+    return backend_class()
 
 
 def ensure_model(model_key: str | None = None) -> str:

@@ -11,11 +11,12 @@ from typing import Any, Optional
 import litert_lm
 from pydantic import BaseModel, ConfigDict
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from . import config
 from .config import (
     CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_BACKEND,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REASONING_EFFORT,
     DEFAULT_TEMPERATURE,
@@ -38,6 +39,7 @@ from .config import (
     engine,
     conversation_worker,
     ensure_model,
+    resolve_backend,
 )
 from .models import ChatCompletionRequest, InferenceJob
 
@@ -57,9 +59,15 @@ class AdminReconfigureRequest(BaseModel):
     repetition_penalty: Optional[float] = None
     constrained_decoding: Optional[bool] = None
     speculative_decoding: Optional[bool] = None
+    backend: Optional[str] = None
     malformed_tool_call_retries: Optional[int] = None
     max_tool_argument_string_length: Optional[int] = None
     max_tool_calls_per_generation: Optional[int] = None
+
+
+class ShellApprovalDecision(BaseModel):
+    approved: bool
+
 
 from .utils.message import canonical_messages
 from .utils.tools import normalize_tool_definitions
@@ -68,7 +76,10 @@ from .utils.token import (
     estimate_context_budget,
     estimate_messages_tokens,
 )
-from .workspace_tools import resolve_workspace_root
+from .workspace_tools import (
+    resolve_workspace_root,
+    shell_approval_broker,
+)
 from .engine.streaming import (
     make_error_stream_chunk,
     make_initial_stream_chunk,
@@ -83,6 +94,12 @@ from .engine.streaming import (
 # ---------------------------------------------------------------------------
 
 _web_chat_html: str = ""
+_highlight_js_path = (
+    Path(__file__).resolve().parent
+    / "vendor"
+    / "highlightjs"
+    / "highlight.min.js"
+)
 
 def _load_web_chat_html() -> str:
     global _web_chat_html
@@ -138,12 +155,16 @@ def _initialize_model_runtime():
         str(Path(resolved_model_path).parent),
     )
 
-    print("Loading LiteRT-LM model with the GPU backend...")
+    backend = resolve_backend(model_key)
+    backend_name = type(backend).__name__
+
+    print(f"Loading LiteRT-LM model with the {backend_name} backend...")
     print(f"Model: {Path(resolved_model_path).resolve()}")
     if model_key:
         print(f"Model key: {model_key}")
     print(f"Disk cache: {Path(cache_dir).resolve()}")
-    print(f"KV capacity: {MAX_NUM_TOKENS:,} tokens")
+    effective_max_num_tokens = _effective_max_num_tokens(model_key)
+    print(f"KV capacity: {effective_max_num_tokens:,} tokens")
     print(f"Default output limit: {DEFAULT_MAX_OUTPUT_TOKENS:,} tokens")
     print(
         "Tool response limit: "
@@ -181,9 +202,9 @@ def _initialize_model_runtime():
     print(f"Tool-call temperature: request/default ({DEFAULT_TEMPERATURE})")
 
     engine_kwargs: dict[str, Any] = {
-        "backend": litert_lm.Backend.GPU(),
+        "backend": backend,
         "enable_speculative_decoding": ENABLE_SPECULATIVE_DECODING,
-        "max_num_tokens": MAX_NUM_TOKENS,
+        "max_num_tokens": effective_max_num_tokens,
     }
 
     engine_parameters = set(
@@ -306,6 +327,22 @@ async def web_chat_alias():
     return await web_chat()
 
 
+@app.get(
+    "/assets/highlight.min.js",
+    response_class=FileResponse,
+    include_in_schema=False,
+)
+async def highlight_javascript():
+    if not config.WEB_UI_ENABLED or not _highlight_js_path.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found.")
+
+    return FileResponse(
+        _highlight_js_path,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @app.post("/v1/conversation/reset")
 async def reset_conversation():
     if conversation_worker is None:
@@ -327,6 +364,38 @@ async def reset_conversation():
         _request_lock.release()
 
 
+@app.get("/v1/workspace/shell-approvals/{approval_session_id}")
+async def get_shell_approval(approval_session_id: str):
+    """Return the command currently waiting on this approval session."""
+    return {
+        "pending": shell_approval_broker.get_pending(
+            approval_session_id
+        )
+    }
+
+
+@app.post(
+    "/v1/workspace/shell-approvals/"
+    "{approval_session_id}/{call_id}"
+)
+async def decide_shell_approval(
+    approval_session_id: str,
+    call_id: str,
+    body: ShellApprovalDecision,
+):
+    resolved = shell_approval_broker.resolve(
+        approval_session_id,
+        call_id,
+        body.approved,
+    )
+    if not resolved:
+        raise HTTPException(
+            status_code=404,
+            detail="This shell approval is no longer pending.",
+        )
+    return {"status": "approved" if body.approved else "denied"}
+
+
 @app.get("/health")
 async def health():
     model_key = config.CURRENT_MODEL_KEY
@@ -344,12 +413,12 @@ async def health():
         ),
         "model_loading": config.MODEL_LOADING,
         "model_load_error": config.MODEL_LOAD_ERROR,
-        "backend": "gpu",
+        "backend": DEFAULT_BACKEND,
         "model": config.MODEL_PATH,
         "model_key": model_key,
         "model_display": model_display,
-        "max_num_tokens": MAX_NUM_TOKENS,
-        "default_max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_num_tokens": _effective_max_num_tokens(model_key),
+        "default_max_output_tokens": _effective_default_max_output_tokens(model_key),
         "max_tool_response_tokens": MAX_TOOL_RESPONSE_TOKENS,
         "context_safety_margin_tokens": CONTEXT_SAFETY_MARGIN_TOKENS,
         "inference_timeout_seconds": INFERENCE_TIMEOUT_SECONDS,
@@ -433,6 +502,21 @@ async def chat_completions(
                 detail=str(exc),
             ) from exc
         request.workspace_path = str(workspace_root)
+        if request.workspace_shell_approval_id is not None:
+            approval_id = request.workspace_shell_approval_id.strip()
+            if (
+                not approval_id
+                or len(approval_id) > 128
+                or not all(
+                    character.isalnum() or character in "-_"
+                    for character in approval_id
+                )
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid workspace_shell_approval_id.",
+                )
+            request.workspace_shell_approval_id = approval_id
 
     if not _request_lock.acquire(blocking=False):
         raise HTTPException(
@@ -449,6 +533,7 @@ async def chat_completions(
             normalized_messages,
         )
 
+        effective_max_num_tokens = _effective_max_num_tokens()
         with _console_lock:
             print(
                 "\n[context-budget] "
@@ -457,12 +542,12 @@ async def chat_completions(
                 f"output={budget['output_tokens']:,} "
                 f"margin={budget['safety_margin_tokens']:,} "
                 f"projected≈{budget['projected_tokens']:,}/"
-                f"{MAX_NUM_TOKENS:,}",
+                f"{effective_max_num_tokens:,}",
                 file=sys.stderr,
                 flush=True,
             )
 
-        if budget["projected_tokens"] > MAX_NUM_TOKENS:
+        if budget["projected_tokens"] > effective_max_num_tokens:
             raise HTTPException(
                 status_code=413,
                 detail=(
@@ -472,7 +557,7 @@ async def chat_completions(
                     f"output reserve={budget['output_tokens']:,}, "
                     f"safety margin={budget['safety_margin_tokens']:,}, "
                     f"projected≈{budget['projected_tokens']:,}, "
-                    f"limit={MAX_NUM_TOKENS:,}. "
+                    f"limit={effective_max_num_tokens:,}. "
                     "Compact or start a new Pi session, reduce tool output, "
                     "or increase LITERT_MAX_NUM_TOKENS."
                 ),
@@ -557,6 +642,10 @@ async def chat_completions(
                         yield "data: [DONE]\n\n"
                         break
             finally:
+                if request.workspace_shell_approval_id:
+                    shell_approval_broker.deny_pending(
+                        request.workspace_shell_approval_id
+                    )
                 if not completed:
                     job.cancel_event.set()
                     if conversation_worker is not None:
@@ -668,6 +757,10 @@ async def chat_completions(
             detail=str(exc),
         ) from exc
     finally:
+        if request.workspace_shell_approval_id:
+            shell_approval_broker.deny_pending(
+                request.workspace_shell_approval_id
+            )
         _request_lock.release()
 
 
@@ -676,11 +769,34 @@ async def chat_completions(
 # ---------------------------------------------------------------------------
 
 
-def _create_engine():
+def _effective_max_num_tokens(model_key: str | None = None) -> int:
+    """Return the configured context size capped by the model bundle."""
+    key = model_key if model_key is not None else config.CURRENT_MODEL_KEY
+    entry = MODEL_REGISTRY.get(key, {}) if key else {}
+    model_limit = entry.get("max_num_tokens")
+    if model_limit is None:
+        return config.MAX_NUM_TOKENS
+    return min(config.MAX_NUM_TOKENS, int(model_limit))
+
+
+def _effective_default_max_output_tokens(model_key: str | None = None) -> int:
+    """Return the configured output limit capped by the model default."""
+    key = model_key if model_key is not None else config.CURRENT_MODEL_KEY
+    entry = MODEL_REGISTRY.get(key, {}) if key else {}
+    model_limit = entry.get("default_max_output_tokens")
+    if model_limit is None:
+        return config.DEFAULT_MAX_OUTPUT_TOKENS
+    return min(config.DEFAULT_MAX_OUTPUT_TOKENS, int(model_limit))
+
+
+def _create_engine(backend=None):
+    if backend is None:
+        backend = resolve_backend(config.CURRENT_MODEL_KEY)
+
     engine_kwargs: dict[str, Any] = {
-        "backend": litert_lm.Backend.GPU(),
+        "backend": backend,
         "enable_speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
-        "max_num_tokens": config.MAX_NUM_TOKENS,
+        "max_num_tokens": _effective_max_num_tokens(),
     }
 
     engine_parameters = set(
@@ -710,8 +826,8 @@ def _create_engine():
 @app.get("/v1/admin/config")
 async def admin_get_config():
     return {
-        "max_num_tokens": config.MAX_NUM_TOKENS,
-        "default_max_output_tokens": config.DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_num_tokens": _effective_max_num_tokens(),
+        "default_max_output_tokens": _effective_default_max_output_tokens(),
         "max_tool_response_tokens": config.MAX_TOOL_RESPONSE_TOKENS,
         "context_safety_margin_tokens": config.CONTEXT_SAFETY_MARGIN_TOKENS,
         "inference_timeout_seconds": config.INFERENCE_TIMEOUT_SECONDS,
@@ -722,6 +838,7 @@ async def admin_get_config():
         "repetition_penalty": config.DEFAULT_REPETITION_PENALTY,
         "constrained_decoding": config.ENABLE_CONSTRAINED_DECODING,
         "speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
+        "backend": config.DEFAULT_BACKEND,
         "malformed_tool_call_retries": config.MALFORMED_TOOL_CALL_RETRIES,
         "max_tool_argument_string_length": config.MAX_TOOL_ARGUMENT_STRING_LENGTH,
         "max_tool_calls_per_generation": config.MAX_TOOL_CALLS_PER_GENERATION,
@@ -777,6 +894,9 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
         if body.speculative_decoding is not None:
             config.ENABLE_SPECULATIVE_DECODING = body.speculative_decoding
             changed.append(f"speculative_decoding={body.speculative_decoding}")
+        if body.backend is not None:
+            config.DEFAULT_BACKEND = body.backend
+            changed.append(f"backend={body.backend}")
         if body.malformed_tool_call_retries is not None:
             config.MALFORMED_TOOL_CALL_RETRIES = body.malformed_tool_call_retries
             changed.append(f"malformed_tool_call_retries={body.malformed_tool_call_retries}")
@@ -804,7 +924,12 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
             engine = None
 
         # Recreate
-        engine = _create_engine()
+        engine = _create_engine(
+            backend=resolve_backend(
+                config.CURRENT_MODEL_KEY,
+                request_backend=config.DEFAULT_BACKEND,
+            )
+        )
         config.engine = engine
 
         from .engine.worker import PersistentConversationWorker
@@ -840,6 +965,7 @@ async def admin_list_models():
             "display": entry["display"],
             "repo": entry["repo"],
             "filename": entry["filename"],
+            "backend": entry.get("backend", DEFAULT_BACKEND),
             "downloaded": dest.is_file(),
             "path": str(dest) if dest.is_file() else None,
         })
@@ -848,6 +974,7 @@ async def admin_list_models():
         "models": models,
         "current": config.CURRENT_MODEL_KEY,
         "current_path": config.MODEL_PATH,
+        "current_backend": config.DEFAULT_BACKEND,
     }
 
 
@@ -897,7 +1024,9 @@ async def admin_switch_model(body: SwitchModelRequest):
             engine = None
 
         # Create new engine with the new model
-        engine = _create_engine()
+        engine = _create_engine(
+            backend=resolve_backend(body.key)
+        )
         config.engine = engine
 
         from .engine.worker import PersistentConversationWorker

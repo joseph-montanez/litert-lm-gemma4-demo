@@ -1,11 +1,14 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from litert_proxy.workspace_tools import (
     build_workspace_tools,
     resolve_workspace_root,
+    ShellApprovalBroker,
     WorkspaceToolEventHandler,
 )
 
@@ -20,6 +23,7 @@ class WorkspaceToolsTest(unittest.TestCase):
             encoding="utf-8",
         )
         (self.root / "README.md").write_text("hello\n", encoding="utf-8")
+        (self.root / "data.bin").write_bytes(b"\x00\x01\x02\x03")
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -47,20 +51,26 @@ class WorkspaceToolsTest(unittest.TestCase):
     def test_read_only_toolset_does_not_register_write(self):
         self.assertEqual(
             set(self.tools()),
-            {"list", "glob", "grep", "read", "line_count"},
+            {"find", "grep", "read", "line_count", "size", "sort", "head", "tail", "platform"},
         )
 
-    def test_list_glob_grep_and_read(self):
+    def test_find_grep_and_read(self):
         tools = self.tools()
 
-        listed = self.execute(
-            tools["list"],
+        found = self.execute(
+            tools["find"],
             {"path": "src", "recursive": True},
         )
-        self.assertEqual(listed["entries"][0]["path"], "src/app.py")
+        self.assertEqual(found["entries"][0]["path"], "src/app.py")
 
-        globbed = self.execute(tools["glob"], {"pattern": "**/*.py"})
-        self.assertEqual(globbed["matches"], ["src/app.py"])
+        found_glob = self.execute(
+            tools["find"],
+            {"pattern": "**/*.py", "recursive": True},
+        )
+        self.assertEqual(
+            [e["path"] for e in found_glob["entries"]],
+            ["src/app.py"],
+        )
 
         grepped = self.execute(
             tools["grep"],
@@ -79,6 +89,58 @@ class WorkspaceToolsTest(unittest.TestCase):
             {"path": "src/app.py"},
         )
         self.assertEqual(counted["lines"], 3)
+
+    def test_sort_tool(self):
+        tools = self.tools()
+        (self.root / "items.txt").write_text(
+            "c\na\nb\na\n",
+            encoding="utf-8",
+        )
+
+        result = self.execute(tools["sort"], {"path": "items.txt"})
+        self.assertEqual(result["content"], "a\na\nb\nc")
+
+        result = self.execute(
+            tools["sort"],
+            {"path": "items.txt", "reverse": True, "unique": True},
+        )
+        self.assertEqual(result["content"], "c\nb\na")
+
+    def test_head_tool(self):
+        tools = self.tools()
+        (self.root / "numbers.txt").write_text(
+            "1\n2\n3\n4\n5\n",
+            encoding="utf-8",
+        )
+
+        result = self.execute(tools["head"], {"path": "numbers.txt", "lines": 3})
+        self.assertEqual(result["content"], "1\n2\n3")
+        self.assertEqual(result["lines"], 3)
+
+    def test_tail_tool(self):
+        tools = self.tools()
+        (self.root / "numbers.txt").write_text(
+            "1\n2\n3\n4\n5\n",
+            encoding="utf-8",
+        )
+
+        result = self.execute(tools["tail"], {"path": "numbers.txt", "lines": 2})
+        self.assertEqual(result["content"], "4\n5")
+        self.assertEqual(result["lines"], 2)
+
+    def test_platform_tool(self):
+        tools = self.tools()
+        result = self.execute(tools["platform"], {})
+        self.assertIn("os", result)
+        self.assertIn("system", result)
+
+    def test_size_tool_returns_bytes(self):
+        tools = self.tools()
+        result = self.execute(tools["size"], {"path": "data.bin"})
+        self.assertEqual(result["bytes"], 4)
+
+        result = self.execute(tools["size"], {"path": "src/app.py"})
+        self.assertEqual(result["bytes"], 33)
 
     def test_line_count_handles_empty_and_unterminated_files(self):
         tools = self.tools()
@@ -99,6 +161,121 @@ class WorkspaceToolsTest(unittest.TestCase):
 
         self.assertEqual(empty["lines"], 0)
         self.assertEqual(unterminated["lines"], 2)
+
+    def test_edit_tool_exact_replacement(self):
+        tools = self.tools(read_only=False)
+        edit = tools["edit"]
+        (self.root / "config.ini").write_text(
+            "[server]\nport = 8080\nhost = localhost\n",
+            encoding="utf-8",
+        )
+
+        result = self.execute(
+            edit,
+            {
+                "path": "config.ini",
+                "oldText": "port = 8080",
+                "newText": "port = 9090",
+            },
+        )
+        self.assertEqual(result["operation"], "edited")
+        self.assertEqual(
+            (self.root / "config.ini").read_text(encoding="utf-8"),
+            "[server]\nport = 9090\nhost = localhost\n",
+        )
+
+    def test_edit_tool_rejects_duplicate_oldtext(self):
+        tools = self.tools(read_only=False)
+        edit = tools["edit"]
+        (self.root / "dupes.txt").write_text(
+            "dup\nmiddle\ndup\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "2 locations"):
+            self.execute(
+                edit,
+                {"path": "dupes.txt", "oldText": "dup", "newText": "x"},
+            )
+
+    def test_edit_tool_rejects_missing_oldtext(self):
+        tools = self.tools(read_only=False)
+        edit = tools["edit"]
+        (self.root / "data.txt").write_text("hello", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.execute(
+                edit,
+                {"path": "data.txt", "oldText": "gone", "newText": "x"},
+            )
+
+    def test_shell_tool_executes_command(self):
+        tools = self.tools(read_only=False)
+        shell = tools["shell"]
+
+        result = self.execute(
+            shell,
+            {"command": "echo hello"},
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("hello", result["stdout"])
+
+    def test_shell_tool_reports_failure(self):
+        tools = self.tools(read_only=False)
+        shell = tools["shell"]
+
+        result = self.execute(
+            shell,
+            {"command": "exit 1"},
+        )
+        self.assertEqual(result["exit_code"], 1)
+
+    def test_shell_call_is_denied_without_approval_session(self):
+        handler = WorkspaceToolEventHandler(workspace_root=self.root)
+
+        self.assertFalse(handler.approve_tool_call({
+            "function": {
+                "name": "shell",
+                "arguments": {"command": "echo should-not-run"},
+            }
+        }))
+
+    def test_shell_approval_broker_exposes_and_resolves_exact_command(self):
+        broker = ShellApprovalBroker()
+        result = []
+
+        waiter = threading.Thread(
+            target=lambda: result.append(
+                broker.request(
+                    "browser-session",
+                    "echo hello && pwd",
+                    self.root,
+                    timeout=1,
+                )
+            )
+        )
+        waiter.start()
+
+        deadline = time.monotonic() + 1
+        pending = None
+        while pending is None and time.monotonic() < deadline:
+            pending = broker.get_pending("browser-session")
+            if pending is None:
+                time.sleep(0.01)
+
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["command"], "echo hello && pwd")
+        self.assertEqual(pending["workspace"], str(self.root))
+        self.assertTrue(
+            broker.resolve(
+                "browser-session",
+                pending["call_id"],
+                True,
+            )
+        )
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [True])
 
     def test_write_tool_creates_and_appends(self):
         write = self.tools(read_only=False)["write"]
@@ -152,17 +329,17 @@ class WorkspaceToolsTest(unittest.TestCase):
 
     def test_repeated_native_tool_calls_are_stopped(self):
         handler = WorkspaceToolEventHandler()
-        call = {
+        find_call = {
             "function": {
-                "name": "list",
+                "name": "find",
                 "arguments": {"path": ".", "recursive": True},
             }
         }
 
-        self.assertTrue(handler.approve_tool_call(call))
-        self.assertTrue(handler.approve_tool_call(call))
+        self.assertTrue(handler.approve_tool_call(find_call))
+        self.assertTrue(handler.approve_tool_call(find_call))
         with self.assertRaisesRegex(RuntimeError, "repeated"):
-            handler.approve_tool_call(call)
+            handler.approve_tool_call(find_call)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@
   --text:#171717; --muted:#737373; --line:#e5e5e5;
   --accent:#2563eb; --user:#eff6ff; --assistant:#ffffff;
   --reasoning-bg:#fafafa; --reasoning-text:#525252;
+  --syntax-comment:#6e7781; --syntax-keyword:#cf222e; --syntax-title:#8250df;
+  --syntax-value:#953800; --syntax-string:#0a3069; --syntax-symbol:#0550ae;
+  --syntax-tag:#116329;
   --shadow:0 1px 3px rgba(0,0,0,.04);
 }
 * { box-sizing:border-box; }
@@ -41,6 +44,9 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 #themeToggle { background:var(--panel2); color:var(--text);
   border:1px solid var(--line); border-radius:8px; padding:8px 12px;
   font-size:15px; cursor:pointer; line-height:1; }
+#modelBackend { color:var(--muted); background:var(--panel2);
+  border:1px solid var(--line); border-radius:999px; padding:3px 7px;
+  font-size:11px; font-weight:700; letter-spacing:.05em; }
 #messages { overflow:auto; padding:24px max(18px,calc((100vw - 900px)/2));
   display:flex; flex-direction:column; gap:16px; }
 .message { border:1px solid var(--line); border-radius:12px;
@@ -48,6 +54,47 @@ button:disabled { opacity:.5; cursor:not-allowed; }
   box-shadow:var(--shadow); }
 .user { background:var(--user); align-self:flex-end; max-width:82%; }
 .assistant { background:var(--assistant); align-self:stretch; }
+.message-content.markdown { white-space:normal; overflow-wrap:anywhere; }
+.markdown > :first-child { margin-top:0; }
+.markdown > :last-child { margin-bottom:0; }
+.markdown p, .markdown ul, .markdown ol, .markdown blockquote,
+.markdown pre { margin:0 0 12px; }
+.markdown h1, .markdown h2, .markdown h3,
+.markdown h4, .markdown h5, .markdown h6 {
+  line-height:1.25; margin:20px 0 10px;
+}
+.markdown h1 { font-size:1.65em; }
+.markdown h2 { font-size:1.4em; }
+.markdown h3 { font-size:1.2em; }
+.markdown ul, .markdown ol { padding-left:1.6em; }
+.markdown li + li { margin-top:4px; }
+.markdown blockquote { border-left:3px solid var(--line); color:var(--muted);
+  padding-left:12px; }
+.markdown hr { border:0; border-top:1px solid var(--line); margin:18px 0; }
+.markdown a { color:var(--accent); }
+.markdown img { display:block; max-width:100%; height:auto; margin:12px 0;
+  border-radius:8px; }
+.markdown code { background:var(--panel2); border:1px solid var(--line);
+  border-radius:5px; padding:.12em .35em;
+  font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.markdown pre { background:var(--reasoning-bg); border:1px solid var(--line);
+  border-radius:9px; overflow:auto; padding:12px 14px; }
+.markdown pre code { display:block; min-width:max-content; padding:0;
+  background:none; border:0; white-space:pre; color:var(--reasoning-text); }
+.hljs-comment, .hljs-code, .hljs-formula { color:var(--syntax-comment,#8b949e); }
+.hljs-keyword, .hljs-doctag, .hljs-type, .hljs-template-tag,
+.hljs-template-variable { color:var(--syntax-keyword,#ff7b72); }
+.hljs-title, .hljs-title.class_, .hljs-title.function_ {
+  color:var(--syntax-title,#d2a8ff); }
+.hljs-attr, .hljs-attribute, .hljs-literal, .hljs-meta, .hljs-number,
+.hljs-operator, .hljs-variable { color:var(--syntax-value,#ffa657); }
+.hljs-regexp, .hljs-string { color:var(--syntax-string,#a5d6ff); }
+.hljs-built_in, .hljs-symbol { color:var(--syntax-symbol,#79c0ff); }
+.hljs-name, .hljs-quote, .hljs-selector-pseudo, .hljs-selector-tag {
+  color:var(--syntax-tag,#7ee787); }
+.hljs-section { color:var(--syntax-symbol,#79c0ff); font-weight:700; }
+.hljs-emphasis { font-style:italic; }
+.hljs-strong { font-weight:700; }
 .role { color:var(--muted); font-size:12px; text-transform:uppercase;
   letter-spacing:.08em; margin-bottom:6px; }
 .reasoning { margin:0 0 12px; border:1px solid var(--line);
@@ -80,6 +127,8 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   border-radius:14px; padding:24px 28px; max-width:520px; width:94vw;
   max-height:90vh; overflow:auto; box-shadow:0 8px 32px rgba(0,0,0,.35); }
 .modal h2 { margin:0 0 6px; font-size:18px; }
+.modal h3 { margin:18px 0 8px; font-size:14px; }
+.modal .section-note { color:var(--muted); font-size:12px; margin:0 0 10px; }
 .modal .warning { background:var(--reasoning-bg); border:1px solid var(--line);
   border-radius:8px; padding:10px 14px; margin:14px 0;
   color:var(--muted); font-size:13px; display:flex; gap:8px; align-items:flex-start; }
@@ -88,6 +137,12 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
 .modal .grid input { width:100%; }
 .modal .btns { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
 #serverStatus { color:var(--muted); font-size:12px; margin-top:8px; }
+#shellApprovalCommand { margin:12px 0; max-height:220px; overflow:auto;
+  white-space:pre-wrap; overflow-wrap:anywhere; background:var(--reasoning-bg);
+  border:1px solid var(--line); border-radius:8px; padding:12px;
+  color:var(--text); font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+#shellApprovalWorkspace { display:block; margin-top:4px; overflow-wrap:anywhere;
+  color:var(--text); }
 </style>
 </head>
 <body>
@@ -99,6 +154,7 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
       <option value="">Loading…</option>
     </select>
   </label>
+  <span id="modelBackend" title="Backend used by the selected model">—</span>
   <label>Thinking
     <select id="effort">
       <option value="none">None</option>
@@ -107,24 +163,9 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
       <option value="medium">Medium</option>
       <option value="high" selected>High</option>
       <option value="xhigh">Extra high</option>
+      <option value="max">Max</option>
     </select>
   </label>
-  <label>Temperature <input id="temperature" type="number" min="0" max="2"
-    step="0.05" value="1.0" style="width:64px"></label>
-  <label>Max out <input id="maxTokens" type="number" min="1"
-    value="4096" style="width:76px"></label>
-  <label>Top-P <input id="topP" type="number" min="0" max="1"
-    step="0.05" value="0.95" style="width:64px"></label>
-  <label>Top-K <input id="topK" type="number" min="1" max="256"
-    step="1" value="64" style="width:64px"></label>
-  <label>Seed <input id="seed" type="number" min="0"
-    placeholder="auto" style="width:72px"></label>
-  <label>Rep.pen <input id="repPenalty" type="number" min="1" max="2"
-    step="0.01" value="1.12" style="width:68px"></label>
-  <label>Freq.pen <input id="freqPenalty" type="number" min="-2" max="2"
-    step="0.1" value="0" style="width:68px"></label>
-  <label>Pres.pen <input id="presPenalty" type="number" min="-2" max="2"
-    step="0.1" value="0" style="width:68px"></label>
   <button id="themeToggle" type="button" title="Toggle light/dark theme">☀️</button>
   <button id="serverBtn" class="secondary" type="button">⚙️ Server</button>
   <button id="newChat" class="secondary" type="button">New chat</button>
@@ -163,22 +204,66 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
 
 <div class="overlay hidden" id="serverOverlay">
   <div class="modal">
-    <h2>⚙️ Server Settings</h2>
+    <h2>⚙️ Server &amp; Generation Settings</h2>
+    <h3>Generation</h3>
+    <p class="section-note">These settings apply to the next message.</p>
+    <div class="grid">
+      <label>Temperature <input id="temperature" type="number" min="0" max="2"
+        step="0.05" value="1.0"></label>
+      <label id="maxOutLabel" style="cursor:pointer" title="Click the label to use the server maximum">Max output tokens
+        <input id="maxTokens" type="number" min="1" value="4096">
+      </label>
+      <label>Top-P <input id="topP" type="number" min="0" max="1"
+        step="0.05" value="0.95"></label>
+      <label>Top-K <input id="topK" type="number" min="1" max="256"
+        step="1" value="64"></label>
+      <label>Seed <input id="seed" type="number" min="0" placeholder="auto"></label>
+      <label>Repetition penalty <input id="repPenalty" type="number" min="1" max="2"
+        step="0.01" value="1.12"></label>
+      <label>Frequency penalty <input id="freqPenalty" type="number" min="-2" max="2"
+        step="0.1" value="0"></label>
+      <label>Presence penalty <input id="presPenalty" type="number" min="-2" max="2"
+        step="0.1" value="0"></label>
+    </div>
+    <h3>Server</h3>
     <div class="warning">
       <span>⚠️</span>
-      <span>Changing these settings will <strong>restart the engine</strong> and clear all conversation state. In-flight generations will be cancelled.</span>
+      <span>Restarting with changes below will clear conversation state. In-flight generations will be cancelled.</span>
     </div>
     <div class="grid" id="serverGrid">
       <!-- populated by JS -->
     </div>
     <span id="serverStatus"></span>
     <div class="btns">
-      <button class="secondary" id="serverCancel" type="button">Cancel</button>
+      <button class="secondary" id="serverCancel" type="button">Close</button>
       <button id="serverRestart" type="button">Restart Engine</button>
     </div>
   </div>
 </div>
 
+<div class="overlay hidden" id="shellApprovalOverlay">
+  <div class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="shellApprovalTitle">
+    <h2 id="shellApprovalTitle">Approve shell command?</h2>
+    <p class="section-note">The model requested this exact command:</p>
+    <pre id="shellApprovalCommand"></pre>
+    <p class="section-note">Working directory:
+      <code id="shellApprovalWorkspace"></code>
+    </p>
+    <div class="warning">
+      <span>⚠️</span>
+      <span>A working directory is not a sandbox. The command can use absolute
+        paths, access parent folders, run programs, and make network requests
+        with your user permissions.</span>
+    </div>
+    <div class="btns">
+      <button class="secondary" id="shellDeny" type="button">Deny</button>
+      <button id="shellApprove" type="button">Approve once</button>
+    </div>
+  </div>
+</div>
+
+<script src="/assets/highlight.min.js"></script>
 <script>
 const messages = [];
 const list = document.getElementById("messages");
@@ -193,7 +278,30 @@ const workspaceTools = document.getElementById("workspaceTools");
 const workspacePath = document.getElementById("workspacePath");
 const workspaceReadOnly = document.getElementById("workspaceReadOnly");
 const workspaceToolSummary = document.getElementById("workspaceToolSummary");
+const shellApprovalOverlay = document.getElementById("shellApprovalOverlay");
+const shellApprovalCommand = document.getElementById("shellApprovalCommand");
+const shellApprovalWorkspace = document.getElementById("shellApprovalWorkspace");
+const shellApproveButton = document.getElementById("shellApprove");
+const shellDenyButton = document.getElementById("shellDeny");
 let controller = null;
+let _serverConfig = {};
+let shellApprovalTimer = null;
+let shellApprovalPollBusy = false;
+let activeShellApproval = null;
+
+function createApprovalSessionId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return `web-${Array.from(bytes, byte =>
+      byte.toString(16).padStart(2, "0")).join("")}`;
+  }
+  const random = Math.random().toString(36).slice(2);
+  return `web-${Date.now().toString(36)}-${random}`;
+}
+
+const shellApprovalSessionId = createApprovalSessionId();
 
 function updateWorkspaceTools() {
   const enabled = workspaceTools.checked;
@@ -202,8 +310,8 @@ function updateWorkspaceTools() {
   workspaceToolSummary.textContent = !enabled
     ? "Disabled"
     : workspaceReadOnly.checked
-      ? "list · glob · grep · read · line_count"
-      : "list · glob · grep · read · line_count · write";
+      ? "find · grep · read · line_count · size · sort · head · tail · platform"
+      : "find · grep · read · line_count · size · sort · head · tail · platform · write · edit · shell";
   empty.textContent = enabled
     ? "Workspace tools are enabled for the selected folder."
     : "No tools, MCP, skills, or AGENTS.md are loaded here.";
@@ -245,7 +353,17 @@ themeToggle.addEventListener("click", () => {
 
 // --- model selector ---
 const modelSelect = document.getElementById("modelSelect");
+const modelBackend = document.getElementById("modelBackend");
 let switchingModel = false;
+let modelBackends = {};
+
+function updateModelBackend() {
+  const backend = modelBackends[modelSelect.value];
+  modelBackend.textContent = backend ? backend.toUpperCase() : "—";
+  modelBackend.title = backend
+    ? `This model runs on the ${backend.toUpperCase()} backend`
+    : "Backend used by the selected model";
+}
 
 async function loadModels() {
   try {
@@ -253,13 +371,20 @@ async function loadModels() {
     if (!resp.ok) return;
     const data = await resp.json();
     modelSelect.innerHTML = "";
+    modelBackends = {};
     data.models.forEach(m => {
+      modelBackends[m.key] = m.backend;
       const opt = document.createElement("option");
       opt.value = m.key;
-      opt.textContent = m.display + (m.downloaded ? "" : " (needs download)");
+      const backend = m.backend ? ` · ${m.backend.toUpperCase()}` : "";
+      opt.textContent = m.display + backend + (m.downloaded ? "" : " (needs download)");
       if (m.key === data.current) opt.selected = true;
       modelSelect.appendChild(opt);
     });
+    if (!data.current && data.current_backend)
+      modelBackend.textContent = data.current_backend.toUpperCase();
+    else
+      updateModelBackend();
   } catch (_) {}
 }
 
@@ -301,6 +426,7 @@ modelSelect.addEventListener("change", async () => {
   if (switchingModel) return;
   const key = modelSelect.value;
   if (!key) return;
+  updateModelBackend();
 
   switchingModel = true;
   modelSelect.disabled = true;
@@ -328,6 +454,7 @@ modelSelect.addEventListener("change", async () => {
     await loadModels();
     // Re-select the current model
     modelSelect.value = result.key;
+    await loadChatDefaults();
   } catch (e) {
     status.textContent = "Model switch failed: " + e.message;
     await loadModels();
@@ -357,6 +484,7 @@ function addMessage(role, text="") {
   const reasoningText = document.createElement("pre");
   reasoning.append(summary, reasoningText);
   const content = document.createElement("div");
+  content.className = "message-content";
   content.textContent = text;
   const metrics = document.createElement("div");
   metrics.className = "metrics";
@@ -366,12 +494,251 @@ function addMessage(role, text="") {
   return {box, content, reasoning, reasoningText, metrics};
 }
 
+function isSafeLink(href) {
+  const value = href.trim();
+  return /^(https?:|mailto:)/i.test(value) ||
+    value.startsWith("/") || value.startsWith("#") || value.startsWith("./") ||
+    value.startsWith("../");
+}
+
+function appendInline(parent, source) {
+  const token = /(`+)([\s\S]*?)\1|(!?)\[([^\]]+)\]\(([^\s)]+)(?:\s+["']([^"']*)["'])?\)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*]+)\*|_([^_]+)_/g;
+  let offset = 0;
+  let match;
+  while ((match = token.exec(source)) !== null) {
+    parent.append(document.createTextNode(source.slice(offset, match.index)));
+    let element;
+    if (match[1]) {
+      element = document.createElement("code");
+      element.textContent = match[2].replace(/^ | $/g, "");
+    } else if (match[4]) {
+      const label = match[4];
+      const href = match[5];
+      if (match[3] === "!" && isSafeLink(href)) {
+        element = document.createElement("img");
+        element.src = href;
+        element.alt = label;
+        element.loading = "lazy";
+      } else if (match[3] !== "!" && isSafeLink(href)) {
+        element = document.createElement("a");
+        element.href = href;
+        element.title = match[6] || "";
+        if (/^https?:/i.test(href)) {
+          element.target = "_blank";
+          element.rel = "noopener noreferrer";
+        }
+        appendInline(element, label);
+      } else {
+        element = document.createTextNode(match[0]);
+      }
+    } else {
+      element = document.createElement(match[7] || match[8] ? "strong" :
+        match[9] ? "del" : "em");
+      appendInline(element, match[7] || match[8] || match[9] || match[10] || match[11]);
+    }
+    parent.append(element);
+    offset = token.lastIndex;
+  }
+  parent.append(document.createTextNode(source.slice(offset)));
+}
+
+function startsMarkdownBlock(line) {
+  return /^\s*$|^ {0,3}(```|~~~)|^ {0,3}#{1,6}\s+|^ {0,3}>|^ {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$|^ {0,3}(?:[-+*]|\d+[.)])\s+/.test(line);
+}
+
+function renderMarkdown(source, target) {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const fragment = document.createDocumentFragment();
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)?.*$/);
+    if (fence) {
+      const marker = fence[1][0];
+      const markerLength = fence[1].length;
+      const codeLines = [];
+      index += 1;
+      const closing = new RegExp(`^ {0,3}${marker}{${markerLength},}\\s*$`);
+      while (index < lines.length && !closing.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      const language = fence[2];
+      if (language && /^[\w.+-]+$/.test(language))
+        code.className = `language-${language}`;
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      fragment.append(pre);
+      continue;
+    }
+
+    const heading = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*$/);
+    if (heading) {
+      const element = document.createElement(`h${heading[1].length}`);
+      appendInline(element, heading[2]);
+      fragment.append(element);
+      index += 1;
+      continue;
+    }
+
+    if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+      fragment.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+
+    if (/^ {0,3}>/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^ {0,3}>/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^ {0,3}> ?/, ""));
+        index += 1;
+      }
+      const quote = document.createElement("blockquote");
+      renderMarkdown(quoteLines.join("\n"), quote);
+      fragment.append(quote);
+      continue;
+    }
+
+    const listItem = line.match(/^ {0,3}([-+*]|\d+[.)])\s+(.+)$/);
+    if (listItem) {
+      const ordered = /^\d/.test(listItem[1]);
+      const listElement = document.createElement(ordered ? "ol" : "ul");
+      while (index < lines.length) {
+        const item = lines[index].match(/^ {0,3}([-+*]|\d+[.)])\s+(.+)$/);
+        if (!item || /^\d/.test(item[1]) !== ordered) break;
+        const li = document.createElement("li");
+        appendInline(li, item[2]);
+        listElement.append(li);
+        index += 1;
+      }
+      fragment.append(listElement);
+      continue;
+    }
+
+    const paragraphLines = [line];
+    index += 1;
+    while (index < lines.length && !startsMarkdownBlock(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    const paragraph = document.createElement("p");
+    paragraphLines.forEach((part, partIndex) => {
+      if (partIndex) {
+        const previous = paragraphLines[partIndex - 1];
+        paragraph.append(previous.endsWith("  ") || previous.endsWith("\\")
+          ? document.createElement("br") : document.createTextNode(" "));
+      }
+      appendInline(paragraph, part.replace(/(?: {2}|\\)$/, ""));
+    });
+    fragment.append(paragraph);
+  }
+
+  target.replaceChildren(fragment);
+  target.classList.add("markdown");
+}
+
+function highlightCodeBlocks(target) {
+  if (!window.hljs) return;
+  target.querySelectorAll("pre code").forEach(block => {
+    const languageClass = Array.from(block.classList)
+      .find(name => name.startsWith("language-"));
+    const language = languageClass?.slice("language-".length);
+    if (language && !window.hljs.getLanguage(language)) {
+      block.classList.remove(languageClass);
+      block.classList.add("nohighlight");
+    }
+    window.hljs.highlightElement(block);
+  });
+}
+
 function parseEvent(block) {
   const lines = block.split(/\r?\n/);
   const data = lines.filter(x => x.startsWith("data:"))
     .map(x => x.slice(5).trim()).join("\n");
   return data;
 }
+
+function hideShellApproval() {
+  shellApprovalOverlay.classList.add("hidden");
+  activeShellApproval = null;
+  shellApproveButton.disabled = false;
+  shellDenyButton.disabled = false;
+}
+
+async function pollShellApproval() {
+  if (shellApprovalPollBusy || !controller) return;
+  shellApprovalPollBusy = true;
+  try {
+    const response = await fetch(
+      `/v1/workspace/shell-approvals/${encodeURIComponent(shellApprovalSessionId)}`
+    );
+    if (!response.ok) return;
+    const data = await response.json();
+    if (!data.pending) return;
+    if (activeShellApproval?.call_id === data.pending.call_id) return;
+
+    activeShellApproval = data.pending;
+    shellApprovalCommand.textContent = data.pending.command;
+    shellApprovalWorkspace.textContent = data.pending.workspace;
+    shellApprovalOverlay.classList.remove("hidden");
+    status.textContent = "Waiting for shell command approval…";
+  } catch (_) {
+    // The generation request will surface server failures itself.
+  } finally {
+    shellApprovalPollBusy = false;
+  }
+}
+
+function startShellApprovalPolling() {
+  clearInterval(shellApprovalTimer);
+  pollShellApproval();
+  shellApprovalTimer = setInterval(pollShellApproval, 350);
+}
+
+function stopShellApprovalPolling() {
+  clearInterval(shellApprovalTimer);
+  shellApprovalTimer = null;
+  hideShellApproval();
+}
+
+async function decideShellApproval(approved) {
+  const pending = activeShellApproval;
+  if (!pending) return;
+  shellApproveButton.disabled = true;
+  shellDenyButton.disabled = true;
+
+  try {
+    const response = await fetch(
+      `/v1/workspace/shell-approvals/` +
+      `${encodeURIComponent(shellApprovalSessionId)}/` +
+      `${encodeURIComponent(pending.call_id)}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({approved})
+      }
+    );
+    if (!response.ok && response.status !== 404)
+      throw new Error(await response.text());
+    hideShellApproval();
+    status.textContent = approved
+      ? "Shell command approved; running…"
+      : "Shell command denied; continuing…";
+  } catch (error) {
+    status.textContent = `Shell approval failed: ${error.message}`;
+    shellApproveButton.disabled = false;
+    shellDenyButton.disabled = false;
+  }
+}
+
+shellApproveButton.addEventListener("click", () => decideShellApproval(true));
+shellDenyButton.addEventListener("click", () => decideShellApproval(false));
 
 async function sendMessage(text) {
   const user = {role:"user", content:text};
@@ -400,6 +767,7 @@ async function sendMessage(text) {
     workspace_tools: workspaceTools.checked,
     workspace_path: workspacePath.value.trim() || null,
     workspace_read_only: workspaceReadOnly.checked,
+    workspace_shell_approval_id: shellApprovalSessionId,
     messages
   };
 
@@ -407,6 +775,7 @@ async function sendMessage(text) {
   let thinking = "";
 
   try {
+    startShellApprovalPolling();
     const response = await fetch("/v1/chat/completions", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
@@ -466,6 +835,10 @@ async function sendMessage(text) {
 
     if (!answer && !thinking) throw new Error("The model returned no content.");
     messages.push({role:"assistant", content:answer || ""});
+    if (answer) {
+      renderMarkdown(answer, assistant.content);
+      highlightCodeBlocks(assistant.content);
+    }
     status.textContent = "Ready";
   } catch (error) {
     if (error.name === "AbortError") {
@@ -475,6 +848,7 @@ async function sendMessage(text) {
       status.textContent = "Error";
     }
   } finally {
+    stopShellApprovalPolling();
     controller = null;
     sendButton.disabled = false;
     stopButton.disabled = true;
@@ -497,7 +871,10 @@ promptBox.addEventListener("keydown", event => {
   }
 });
 
-stopButton.addEventListener("click", () => controller?.abort());
+stopButton.addEventListener("click", () => {
+  if (activeShellApproval) decideShellApproval(false);
+  controller?.abort();
+});
 
 document.getElementById("newChat").addEventListener("click", async () => {
   controller?.abort();
@@ -567,6 +944,7 @@ async function openServerModal() {
     const resp = await fetch("/v1/admin/config");
     if (!resp.ok) throw new Error(await resp.text());
     const config = await resp.json();
+    _serverConfig = config;
     buildGrid(config);
     serverStatus.textContent = "";
   } catch (e) {
@@ -581,8 +959,10 @@ async function loadChatDefaults() {
     const config = await resp.json();
     if (config.reasoning_effort != null)
       document.getElementById("effort").value = config.reasoning_effort;
-    if (config.default_max_output_tokens != null)
-      document.getElementById("maxTokens").value = config.default_max_output_tokens;
+    if (config.default_max_output_tokens != null) {
+      const safety = config.context_safety_margin_tokens || 0;
+      document.getElementById("maxTokens").value = Math.max(1, config.default_max_output_tokens - safety);
+    }
     if (config.temperature != null)
       document.getElementById("temperature").value = config.temperature;
     if (config.top_p != null)
@@ -639,6 +1019,21 @@ document.getElementById("serverRestart").addEventListener("click", async () => {
 });
 
 loadChatDefaults();
+
+// --- Max out click handler ---
+document.getElementById("maxOutLabel").addEventListener("click", async () => {
+  const input = document.getElementById("maxTokens");
+  let cfg = _serverConfig;
+  if (!cfg || !cfg.default_max_output_tokens) {
+    try {
+      const resp = await fetch("/v1/admin/config");
+      if (resp.ok) cfg = await resp.json();
+    } catch (_) {}
+  }
+  const maxOut = cfg?.default_max_output_tokens || 4096;
+  const safety = cfg?.context_safety_margin_tokens || 1024;
+  input.value = Math.max(1, maxOut - safety);
+});
 </script>
 </body>
 </html>

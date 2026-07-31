@@ -41,6 +41,7 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     reasoning_effort: Optional[str] = None
     include_reasoning: Optional[bool] = None
+    backend: Optional[str] = None
 
     tools: Any = None
     tool_choice: Any = None
@@ -49,6 +50,7 @@ class ChatCompletionRequest(BaseModel):
     workspace_tools: bool = False
     workspace_path: Optional[str] = None
     workspace_read_only: bool = True
+    workspace_shell_approval_id: Optional[str] = None
 
 
 class MalformedToolCallError(RuntimeError):

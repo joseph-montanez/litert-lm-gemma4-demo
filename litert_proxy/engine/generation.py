@@ -100,6 +100,13 @@ def generation_events(
         "tool_event_handler",
         None,
     )
+    set_shell_approval_id = getattr(
+        tool_event_handler,
+        "set_shell_approval_id",
+        None,
+    )
+    if callable(set_shell_approval_id):
+        set_shell_approval_id(request.workspace_shell_approval_id)
     reset_tool_budget = getattr(tool_event_handler, "reset", None)
     if callable(reset_tool_budget):
         reset_tool_budget()

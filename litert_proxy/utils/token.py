@@ -234,7 +234,7 @@ def estimate_input_tokens(input_message: Any) -> int:
 def requested_output_tokens(
     request: "ChatCompletionRequest",
 ) -> int:
-    from ..config import DEFAULT_MAX_OUTPUT_TOKENS
+    from .. import config
 
     value = (
         request.max_completion_tokens
@@ -243,7 +243,14 @@ def requested_output_tokens(
     )
 
     if value is None:
-        value = DEFAULT_MAX_OUTPUT_TOKENS
+        value = config.DEFAULT_MAX_OUTPUT_TOKENS
+        model_key = config.CURRENT_MODEL_KEY
+        if model_key and model_key in config.MODEL_REGISTRY:
+            model_default = config.MODEL_REGISTRY[model_key].get(
+                "default_max_output_tokens"
+            )
+            if model_default is not None:
+                value = min(value, int(model_default))
 
     return max(1, int(value))
 
