@@ -6,6 +6,43 @@ MODEL_PATH = os.environ.get(
     "LITERT_MODEL_PATH",
     "gemma-4-E4B-it.litertlm",
 )
+
+# HuggingFace repo for auto-download when model file is missing.
+# Set LITERT_HF_REPO to override; set LITERT_HF_FILENAME to override filename.
+_HF_REPO = os.environ.get(
+    "LITERT_HF_REPO",
+    "litert-community/gemma-4-E4B-it-litert-lm",
+)
+_HF_FILENAME = os.environ.get(
+    "LITERT_HF_FILENAME",
+    "gemma-4-E4B-it.litertlm",
+)
+
+# Model registry: key -> {repo, filename, display}
+# Used by web UI model selector and switch-model API.
+MODEL_REGISTRY = {
+    "gemma-4-E2B-it": {
+        "repo": "litert-community/gemma-4-E2B-it-litert-lm",
+        "filename": "gemma-4-E2B-it.litertlm",
+        "display": "Gemma 4 E2B (2B)",
+    },
+    "gemma-4-E4B-it": {
+        "repo": "litert-community/gemma-4-E4B-it-litert-lm",
+        "filename": "gemma-4-E4B-it.litertlm",
+        "display": "Gemma 4 E4B (4B)",
+    },
+    "gemma-4-12B-it": {
+        "repo": "litert-community/gemma-4-12B-it-litert-lm",
+        "filename": "gemma-4-12B-it.litertlm",
+        "display": "Gemma 4 12B",
+    },
+}
+
+# Currently loaded model key (None = using raw MODEL_PATH / env vars).
+CURRENT_MODEL_KEY: str | None = None
+
+# Directory where registry models are stored.
+_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".litert-lm", "models")
 MAX_NUM_TOKENS = int(os.environ.get("LITERT_MAX_NUM_TOKENS", "32768"))
 DEFAULT_MAX_OUTPUT_TOKENS = int(
     os.environ.get("LITERT_MAX_OUTPUT_TOKENS", "4096")
@@ -95,6 +132,64 @@ ENABLE_SPECULATIVE_DECODING = os.environ.get(
 
 engine = None
 conversation_worker = None
+MODEL_LOADING = False
+MODEL_LOAD_ERROR: str | None = None
 
 _console_lock = threading.Lock()
 _request_lock = threading.Lock()
+
+
+def _download_model(repo_id: str, filename: str, dest: Path) -> str:
+    """Download a model file from HuggingFace to dest path.
+
+    Returns the resolved path to the downloaded file.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError(
+            "Model file not found and huggingface_hub is not installed. "
+            "Install it with: pip install huggingface_hub"
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading {filename} from {repo_id} ...")
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=dest.parent,
+        local_dir_use_symlinks=False,
+    )
+
+    downloaded_path = Path(downloaded).resolve()
+    if downloaded_path != dest:
+        import shutil
+        shutil.move(str(downloaded_path), str(dest))
+
+    print(f"Model downloaded to: {dest}")
+    return str(dest)
+
+
+def ensure_model(model_key: str | None = None) -> str:
+    """Ensure model file exists on disk, downloading if needed.
+
+    If model_key is provided, looks up MODEL_REGISTRY and downloads
+    to ~/.litert-lm/models/<key>.litertlm. Otherwise uses MODEL_PATH
+    and _HF_REPO/_HF_FILENAME env vars.
+
+    Returns resolved absolute model path.
+    """
+    if model_key is not None and model_key in MODEL_REGISTRY:
+        entry = MODEL_REGISTRY[model_key]
+        dest = Path(_MODELS_DIR) / f"{model_key}.litertlm"
+        if dest.is_file():
+            return str(dest)
+        return _download_model(entry["repo"], entry["filename"], dest)
+
+    model_path = Path(MODEL_PATH).resolve()
+    if model_path.is_file():
+        return str(model_path)
+
+    print(f"Model not found at: {model_path}")
+    return _download_model(_HF_REPO, _HF_FILENAME, model_path)

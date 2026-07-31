@@ -252,8 +252,20 @@ def estimate_tool_schema_tokens(
     request: "ChatCompletionRequest",
 ) -> int:
     from .tools import normalize_tool_definitions
+    from ..workspace_tools import (
+        resolve_workspace_root,
+        workspace_tool_definitions,
+    )
 
     definitions = normalize_tool_definitions(request)
+    if request.workspace_tools:
+        root = resolve_workspace_root(request.workspace_path or "")
+        definitions.extend(
+            workspace_tool_definitions(
+                root,
+                read_only=request.workspace_read_only,
+            )
+        )
 
     if not definitions:
         return 0

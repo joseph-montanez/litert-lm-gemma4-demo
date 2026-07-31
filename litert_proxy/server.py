@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import queue
 import sys
 import time
@@ -14,7 +15,6 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from . import config
 from .config import (
-    CACHE_DIR,
     CONTEXT_SAFETY_MARGIN_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REASONING_EFFORT,
@@ -29,12 +29,14 @@ from .config import (
     MAX_TOOL_ARGUMENT_STRING_LENGTH,
     MAX_TOOL_RESPONSE_TOKENS,
     MODEL_PATH,
+    MODEL_REGISTRY,
     SSE_HEARTBEAT_SECONDS,
     WEB_UI_TITLE,
     _console_lock,
     _request_lock,
     engine,
     conversation_worker,
+    ensure_model,
 )
 from .models import ChatCompletionRequest, InferenceJob
 
@@ -56,11 +58,13 @@ class AdminReconfigureRequest(BaseModel):
     speculative_decoding: Optional[bool] = None
     malformed_tool_call_retries: Optional[int] = None
 from .utils.message import canonical_messages
+from .utils.tools import normalize_tool_definitions
 from .utils.token import (
     count_tokens,
     estimate_context_budget,
     estimate_messages_tokens,
 )
+from .workspace_tools import resolve_workspace_root
 from .engine.streaming import (
     make_error_stream_chunk,
     make_initial_stream_chunk,
@@ -96,8 +100,7 @@ def _load_web_chat_html() -> str:
 # ---------------------------------------------------------------------------
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _initialize_model_runtime():
     global engine
     global conversation_worker
 
@@ -105,9 +108,37 @@ async def lifespan(app: FastAPI):
         litert_lm.LogSeverity.ERROR
     )
 
+    # Determine model key from MODEL_PATH for registry matching.
+    resolved_model_path = Path(MODEL_PATH).resolve()
+    model_key: str | None = None
+    explicit_path = os.environ.get("LITERT_MODEL_PATH", "").strip()
+    for key, entry in MODEL_REGISTRY.items():
+        if resolved_model_path.name == entry["filename"] or resolved_model_path.name == f"{key}.litertlm":
+            model_key = key
+            break
+
+    if explicit_path and model_key:
+        # User set explicit path that matches a registry filename.
+        # Use user's path but still track the model key for display.
+        resolved_model_path = ensure_model(None)
+        config.MODEL_PATH = resolved_model_path
+        config.CURRENT_MODEL_KEY = model_key
+    else:
+        # No explicit path or no registry match — use registry if key found.
+        resolved_model_path = ensure_model(model_key)
+        config.MODEL_PATH = resolved_model_path
+        config.CURRENT_MODEL_KEY = model_key
+
+    cache_dir = os.environ.get(
+        "LITERT_CACHE_DIR",
+        str(Path(resolved_model_path).parent),
+    )
+
     print("Loading LiteRT-LM model with the GPU backend...")
-    print(f"Model: {Path(MODEL_PATH).resolve()}")
-    print(f"Disk cache: {Path(CACHE_DIR).resolve()}")
+    print(f"Model: {Path(resolved_model_path).resolve()}")
+    if model_key:
+        print(f"Model key: {model_key}")
+    print(f"Disk cache: {Path(cache_dir).resolve()}")
     print(f"KV capacity: {MAX_NUM_TOKENS:,} tokens")
     print(f"Default output limit: {DEFAULT_MAX_OUTPUT_TOKENS:,} tokens")
     print(
@@ -152,10 +183,10 @@ async def lifespan(app: FastAPI):
     )
 
     if "cache_dir" in engine_parameters:
-        engine_kwargs["cache_dir"] = CACHE_DIR
+        engine_kwargs["cache_dir"] = cache_dir
 
     config.engine = litert_lm.Engine(
-        MODEL_PATH,
+        resolved_model_path,
         **engine_kwargs,
     )
     config.engine.__enter__()
@@ -194,9 +225,36 @@ async def lifespan(app: FastAPI):
         f"{'http://localhost:8000/' if config.WEB_UI_ENABLED else 'disabled'}"
     )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global engine
+    global conversation_worker
+
+    config.MODEL_LOADING = True
+    config.MODEL_LOAD_ERROR = None
+    _request_lock.acquire()
+
+    async def load_model():
+        try:
+            await asyncio.to_thread(_initialize_model_runtime)
+        except Exception as exc:
+            config.MODEL_LOAD_ERROR = str(exc)
+            with _console_lock:
+                print(
+                    f"\n[model-load-error] {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            config.MODEL_LOADING = False
+            _request_lock.release()
+
+    load_task = asyncio.create_task(load_model())
+
     yield
 
     print("Shutting down...")
+    await load_task
 
     if conversation_worker is not None:
         conversation_worker.stop()
@@ -263,16 +321,34 @@ async def reset_conversation():
 
 @app.get("/health")
 async def health():
+    model_key = config.CURRENT_MODEL_KEY
+    model_display = None
+    if model_key and model_key in MODEL_REGISTRY:
+        model_display = MODEL_REGISTRY[model_key]["display"]
+
     return {
-        "status": "ok" if engine is not None else "loading",
+        "status": (
+            "error"
+            if config.MODEL_LOAD_ERROR
+            else "ok"
+            if engine is not None
+            else "loading"
+        ),
+        "model_loading": config.MODEL_LOADING,
+        "model_load_error": config.MODEL_LOAD_ERROR,
         "backend": "gpu",
-        "model": MODEL_PATH,
+        "model": config.MODEL_PATH,
+        "model_key": model_key,
+        "model_display": model_display,
         "max_num_tokens": MAX_NUM_TOKENS,
         "default_max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
         "max_tool_response_tokens": MAX_TOOL_RESPONSE_TOKENS,
         "context_safety_margin_tokens": CONTEXT_SAFETY_MARGIN_TOKENS,
         "inference_timeout_seconds": INFERENCE_TIMEOUT_SECONDS,
-        "cache_dir": CACHE_DIR,
+        "cache_dir": os.environ.get(
+            "LITERT_CACHE_DIR",
+            str(Path(config.MODEL_PATH).parent),
+        ),
         "constrained_decoding": ENABLE_CONSTRAINED_DECODING,
         "tool_temperature": DEFAULT_TEMPERATURE,
         "tool_context_mode": config.TOOL_CONTEXT_MODE,
@@ -300,7 +376,7 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    model_id = Path(MODEL_PATH).stem
+    model_id = Path(config.MODEL_PATH).stem
     return {
         "object": "list",
         "data": [
@@ -329,6 +405,26 @@ async def chat_completions(
             status_code=400,
             detail="messages must not be empty.",
         )
+
+    if request.workspace_tools:
+        if normalize_tool_definitions(request):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Native workspace tools cannot be combined with "
+                    "client-supplied OpenAI tools in the same request."
+                ),
+            )
+        try:
+            workspace_root = resolve_workspace_root(
+                request.workspace_path or ""
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+        request.workspace_path = str(workspace_root)
 
     if not _request_lock.acquire(blocking=False):
         raise HTTPException(
@@ -455,7 +551,8 @@ async def chat_completions(
             finally:
                 if not completed:
                     job.cancel_event.set()
-                    conversation_worker.cancel_current()
+                    if conversation_worker is not None:
+                        conversation_worker.cancel_current()
 
                 _request_lock.release()
 
@@ -582,11 +679,15 @@ def _create_engine():
         inspect.signature(litert_lm.Engine).parameters
     )
 
+    model_path = config.MODEL_PATH
     if "cache_dir" in engine_parameters:
-        engine_kwargs["cache_dir"] = CACHE_DIR
+        engine_kwargs["cache_dir"] = os.environ.get(
+            "LITERT_CACHE_DIR",
+            str(Path(model_path).parent),
+        )
 
     engine = litert_lm.Engine(
-        MODEL_PATH,
+        model_path,
         **engine_kwargs,
     )
     engine.__enter__()
@@ -699,6 +800,104 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
         print("[admin] Engine restarted with new configuration.")
 
         return {"status": "restarted", "changes": changed}
+    except Exception:
+        _request_lock.release()
+        raise
+    finally:
+        if _request_lock.locked():
+            _request_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Model selection routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/admin/models")
+async def admin_list_models():
+    """Return available models and the currently loaded model."""
+    models = []
+    for key, entry in MODEL_REGISTRY.items():
+        dest = Path(config._MODELS_DIR) / f"{key}.litertlm"
+        models.append({
+            "key": key,
+            "display": entry["display"],
+            "repo": entry["repo"],
+            "filename": entry["filename"],
+            "downloaded": dest.is_file(),
+            "path": str(dest) if dest.is_file() else None,
+        })
+
+    return {
+        "models": models,
+        "current": config.CURRENT_MODEL_KEY,
+        "current_path": config.MODEL_PATH,
+    }
+
+
+class SwitchModelRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    key: str
+
+
+@app.post("/v1/admin/switch-model")
+async def admin_switch_model(body: SwitchModelRequest):
+    """Switch to a different model from the registry."""
+    global engine, conversation_worker
+
+    if body.key not in MODEL_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model key: {body.key}. "
+                    f"Available: {', '.join(MODEL_REGISTRY.keys())}",
+        )
+
+    if not _request_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot switch models while generation is active.",
+        )
+
+    try:
+        entry = MODEL_REGISTRY[body.key]
+        print(f"\n[admin] Switching model to: {body.key} ({entry['display']})")
+
+        # Download model if needed. This may take a while for large models.
+        resolved_path = ensure_model(body.key)
+        config.MODEL_PATH = resolved_path
+        config.CURRENT_MODEL_KEY = body.key
+
+        print(f"[admin] Model path: {resolved_path}")
+
+        # Stop and tear down current engine + worker
+        if conversation_worker is not None:
+            conversation_worker.stop()
+            conversation_worker = None
+            config.conversation_worker = None
+
+        if engine is not None:
+            config.engine.__exit__(None, None, None)
+            config.engine = None
+            engine = None
+
+        # Create new engine with the new model
+        engine = _create_engine()
+        config.engine = engine
+
+        from .engine.worker import PersistentConversationWorker
+
+        conversation_worker = PersistentConversationWorker()
+        conversation_worker.start()
+        config.conversation_worker = conversation_worker
+
+        print(f"[admin] Successfully switched to: {body.key}")
+
+        return {
+            "status": "switched",
+            "key": body.key,
+            "display": entry["display"],
+            "path": resolved_path,
+        }
     except Exception:
         _request_lock.release()
         raise

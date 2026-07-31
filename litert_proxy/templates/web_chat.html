@@ -58,6 +58,13 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .metrics { color:var(--muted); font-size:12px; margin-top:10px; }
 form { border-top:1px solid var(--line); background:var(--panel);
   padding:12px max(18px,calc((100vw - 900px)/2)); }
+.workspace-tools { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  margin-bottom:9px; padding:8px 10px; border:1px solid var(--line);
+  border-radius:9px; background:var(--reasoning-bg); }
+.workspace-tools label { display:flex; align-items:center; gap:6px; }
+.workspace-tools input[type="checkbox"] { width:auto; margin:0; }
+#workspacePath { width:min(480px,55vw); }
+#workspaceToolSummary { color:var(--muted); font-size:12px; }
 textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
   background:var(--panel2); color:var(--text); border:1px solid var(--line);
   border-radius:10px; padding:11px; }
@@ -87,10 +94,19 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
 <main>
 <header>
   <strong>{title}</strong>
+  <label>Model
+    <select id="modelSelect">
+      <option value="">Loading…</option>
+    </select>
+  </label>
   <label>Thinking
     <select id="effort">
-      <option>none</option><option>low</option><option>medium</option>
-      <option selected>high</option><option>xhigh</option>
+      <option value="none">None</option>
+      <option value="minimal">Minimal</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high" selected>High</option>
+      <option value="xhigh">Extra high</option>
     </select>
   </label>
   <label>Temperature <input id="temperature" type="number" min="0" max="2"
@@ -119,6 +135,21 @@ textarea { width:100%; resize:vertical; min-height:74px; max-height:240px;
 </section>
 
 <form id="composer">
+  <div class="workspace-tools">
+    <label>
+      <input id="workspaceTools" type="checkbox">
+      Workspace tools
+    </label>
+    <label>Folder
+      <input id="workspacePath" type="text"
+        placeholder="/absolute/path/to/folder" disabled>
+    </label>
+    <label>
+      <input id="workspaceReadOnly" type="checkbox" checked disabled>
+      Read only
+    </label>
+    <span id="workspaceToolSummary">Disabled</span>
+  </div>
   <textarea id="prompt" placeholder="Message the local model…" required></textarea>
   <div class="actions">
     <span id="status">Ready</span>
@@ -158,7 +189,41 @@ const status = document.getElementById("status");
 const sendButton = document.getElementById("send");
 const stopButton = document.getElementById("stop");
 const themeToggle = document.getElementById("themeToggle");
+const workspaceTools = document.getElementById("workspaceTools");
+const workspacePath = document.getElementById("workspacePath");
+const workspaceReadOnly = document.getElementById("workspaceReadOnly");
+const workspaceToolSummary = document.getElementById("workspaceToolSummary");
 let controller = null;
+
+function updateWorkspaceTools() {
+  const enabled = workspaceTools.checked;
+  workspacePath.disabled = !enabled;
+  workspaceReadOnly.disabled = !enabled;
+  workspaceToolSummary.textContent = !enabled
+    ? "Disabled"
+    : workspaceReadOnly.checked
+      ? "list · glob · grep · read · line_count"
+      : "list · glob · grep · read · line_count · write";
+  empty.textContent = enabled
+    ? "Workspace tools are enabled for the selected folder."
+    : "No tools, MCP, skills, or AGENTS.md are loaded here.";
+  localStorage.setItem("litert-workspace-tools", enabled ? "true" : "false");
+  localStorage.setItem("litert-workspace-path", workspacePath.value);
+  localStorage.setItem(
+    "litert-workspace-read-only",
+    workspaceReadOnly.checked ? "true" : "false"
+  );
+}
+
+workspaceTools.checked =
+  localStorage.getItem("litert-workspace-tools") === "true";
+workspacePath.value = localStorage.getItem("litert-workspace-path") || "";
+workspaceReadOnly.checked =
+  localStorage.getItem("litert-workspace-read-only") !== "false";
+workspaceTools.addEventListener("change", updateWorkspaceTools);
+workspacePath.addEventListener("change", updateWorkspaceTools);
+workspaceReadOnly.addEventListener("change", updateWorkspaceTools);
+updateWorkspaceTools();
 
 // --- theme ---
 function getTheme() {
@@ -177,6 +242,104 @@ themeToggle.addEventListener("click", () => {
   const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
   applyTheme(next);
 });
+
+// --- model selector ---
+const modelSelect = document.getElementById("modelSelect");
+let switchingModel = false;
+
+async function loadModels() {
+  try {
+    const resp = await fetch("/v1/admin/models");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    modelSelect.innerHTML = "";
+    data.models.forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m.key;
+      opt.textContent = m.display + (m.downloaded ? "" : " (needs download)");
+      if (m.key === data.current) opt.selected = true;
+      modelSelect.appendChild(opt);
+    });
+  } catch (_) {}
+}
+
+async function waitForModelReady() {
+  try {
+    const resp = await fetch("/health");
+    if (!resp.ok) throw new Error(resp.statusText);
+    const health = await resp.json();
+
+    if (health.status === "loading") {
+      status.textContent = "Loading model…";
+      sendButton.disabled = true;
+      modelSelect.disabled = true;
+      setTimeout(waitForModelReady, 1000);
+      return;
+    }
+
+    if (health.status === "error") {
+      status.textContent =
+        "Model failed to load: " + (health.model_load_error || "unknown error");
+      sendButton.disabled = true;
+      modelSelect.disabled = false;
+      return;
+    }
+
+    if (!controller) status.textContent = "Ready";
+    sendButton.disabled = false;
+    modelSelect.disabled = false;
+    await loadModels();
+  } catch (error) {
+    status.textContent = "Waiting for server…";
+    sendButton.disabled = true;
+    modelSelect.disabled = true;
+    setTimeout(waitForModelReady, 1000);
+  }
+}
+
+modelSelect.addEventListener("change", async () => {
+  if (switchingModel) return;
+  const key = modelSelect.value;
+  if (!key) return;
+
+  switchingModel = true;
+  modelSelect.disabled = true;
+  status.textContent = `Switching model to ${key}…`;
+
+  try {
+    const resp = await fetch("/v1/admin/switch-model", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key})
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || resp.statusText);
+    }
+    const result = await resp.json();
+
+    // Reset conversation state on model switch
+    messages.length = 0;
+    list.replaceChildren(empty);
+    empty.style.display = "";
+    status.textContent = `Switched to ${result.display}`;
+
+    // Refresh model list to update downloaded status
+    await loadModels();
+    // Re-select the current model
+    modelSelect.value = result.key;
+  } catch (e) {
+    status.textContent = "Model switch failed: " + e.message;
+    await loadModels();
+  } finally {
+    switchingModel = false;
+    modelSelect.disabled = false;
+  }
+});
+
+// Load models on startup
+loadModels();
+waitForModelReady();
 
 function addMessage(role, text="") {
   empty.style.display = "none";
@@ -225,6 +388,7 @@ async function sendMessage(text) {
     model: "local-litert",
     stream: true,
     reasoning_effort: effort,
+    include_reasoning: effort !== "none",
     temperature: Number(document.getElementById("temperature").value),
     max_completion_tokens: Number(document.getElementById("maxTokens").value),
     top_p: Number(document.getElementById("topP").value),
@@ -233,6 +397,9 @@ async function sendMessage(text) {
     frequency_penalty: Number(document.getElementById("freqPenalty").value),
     presence_penalty: Number(document.getElementById("presPenalty").value),
     seed: Number(document.getElementById("seed").value) || null,
+    workspace_tools: workspaceTools.checked,
+    workspace_path: workspacePath.value.trim() || null,
+    workspace_read_only: workspaceReadOnly.checked,
     messages
   };
 
@@ -405,6 +572,15 @@ async function openServerModal() {
   }
 }
 
+async function loadChatDefaults() {
+  try {
+    const resp = await fetch("/v1/admin/config");
+    if (!resp.ok) return;
+    const config = await resp.json();
+    document.getElementById("effort").value = config.reasoning_effort;
+  } catch (_) {}
+}
+
 function closeServerModal() {
   overlay.classList.add("hidden");
 }
@@ -441,12 +617,15 @@ document.getElementById("serverRestart").addEventListener("click", async () => {
     // Refresh the displayed config
     const cfg = await fetch("/v1/admin/config").then(r => r.json());
     buildGrid(cfg);
+    document.getElementById("effort").value = cfg.reasoning_effort;
   } catch (e) {
     serverStatus.textContent = "Error: " + e.message;
   } finally {
     document.getElementById("serverRestart").disabled = false;
   }
 });
+
+loadChatDefaults();
 </script>
 </body>
 </html>

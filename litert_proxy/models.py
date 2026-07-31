@@ -46,6 +46,10 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any = None
     parallel_tool_calls: Any = None
 
+    workspace_tools: bool = False
+    workspace_path: Optional[str] = None
+    workspace_read_only: bool = True
+
 
 class MalformedToolCallError(RuntimeError):
     pass

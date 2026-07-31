@@ -7,6 +7,8 @@ OpenAI-compatible FastAPI proxy for LiteRT-LM with:
 - selectable tool-call context behavior
 - Gemma thinking/reasoning support
 - OpenAI-style streaming and tool-call responses
+- native, folder-scoped `list`, `glob`, `grep`, `read`, `line_count`, and
+  `write` tools
 - repetition protection
 - context-window preflight checks
 - tool-output truncation
@@ -491,6 +493,9 @@ Supported message fields:
 | `tools` | array or null | OpenAI function-tool schemas. Only entries with `type: "function"` and a valid function name are retained. |
 | `tool_choice` | string or object | `"none"` removes all tools. A named OpenAI function choice filters the available tools to that name. Other values behave like automatic selection. |
 | `parallel_tool_calls` | any | Accepted and included in conversation-cache identity, but the server does not independently implement parallel tool execution. The client executes returned calls. |
+| `workspace_tools` | boolean | Default `false`. Registers native LiteRT-LM filesystem tools that the model executes automatically. |
+| `workspace_path` | string or null | Folder that bounds every native workspace-tool operation. Required when `workspace_tools` is true. |
+| `workspace_read_only` | boolean | Default `true`. When true, the `write` tool is not registered. |
 
 ### Request example
 
@@ -550,6 +555,49 @@ Supported message fields:
   ]
 }
 ```
+
+### Native workspace tools
+
+The built-in web chat has a **Workspace tools** control above the prompt. Enter
+an absolute folder path and leave **Read only** enabled to give the model these
+automatically executed LiteRT-LM tools:
+
+- `list`: list files and directories
+- `glob`: find paths by glob pattern
+- `grep`: search text files with a regular expression
+- `read`: read bounded line ranges from UTF-8 text files
+- `line_count`: count the lines in a UTF-8 text file
+
+Disabling **Read only** also registers `write`, which can create, overwrite, or
+append to files whose parent directory already exists. Read-only enforcement is
+structural: the write tool is omitted from the conversation rather than merely
+described as unavailable.
+
+All tool paths are resolved against the selected folder. Parent traversal and
+symlinks that escape that folder are rejected. Reads, searches, result counts,
+and writes are bounded to protect the model context and server process.
+
+API example:
+
+```json
+{
+  "model": "gemma4-e4b",
+  "stream": true,
+  "workspace_tools": true,
+  "workspace_path": "/absolute/path/to/project",
+  "workspace_read_only": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Find where the HTTP server is initialized."
+    }
+  ]
+}
+```
+
+Native workspace tools cannot be combined with client-supplied OpenAI `tools`
+in one request. The former execute inside LiteRT-LM; the latter are returned to
+the API client for execution.
 
 ## Endpoints
 

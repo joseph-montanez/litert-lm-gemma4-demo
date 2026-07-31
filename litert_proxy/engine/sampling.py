@@ -21,6 +21,11 @@ from ..config import (
 from ..models import ChatCompletionRequest, ProxyTool
 from ..utils.token import json_safe, requested_output_tokens
 from ..utils.tools import normalize_tool_definitions
+from ..workspace_tools import (
+    build_workspace_tools,
+    resolve_workspace_root,
+    WorkspaceToolEventHandler,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +209,9 @@ def conversation_config_signature(
         "tools": json_safe(request.tools),
         "tool_choice": json_safe(request.tool_choice),
         "parallel_tool_calls": json_safe(request.parallel_tool_calls),
+        "workspace_tools": request.workspace_tools,
+        "workspace_path": request.workspace_path,
+        "workspace_read_only": request.workspace_read_only,
         "max_tokens": request.max_tokens,
         "max_completion_tokens": request.max_completion_tokens,
         "stop": json_safe(request.stop),
@@ -261,18 +269,42 @@ def build_conversation_kwargs(
                 flush=True,
             )
 
-    if "tools" in parameters:
-        kwargs["tools"] = (
-            [ProxyTool(definition) for definition in tool_definitions]
-            if tool_definitions
-            else None
+    native_workspace_tools = []
+    if request.workspace_tools:
+        root = resolve_workspace_root(request.workspace_path or "")
+        native_workspace_tools = build_workspace_tools(
+            root,
+            read_only=request.workspace_read_only,
         )
+        with _console_lock:
+            print(
+                "\n[workspace-tools] "
+                f"root={root} "
+                f"mode={'read-only' if request.workspace_read_only else 'read-write'} "
+                f"tools={','.join(tool.name for tool in native_workspace_tools)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if "tools" in parameters:
+        if native_workspace_tools:
+            kwargs["tools"] = native_workspace_tools
+        elif tool_definitions:
+            kwargs["tools"] = [
+                ProxyTool(definition)
+                for definition in tool_definitions
+            ]
+        else:
+            kwargs["tools"] = None
 
     if "automatic_tool_calling" in parameters:
-        kwargs["automatic_tool_calling"] = False
+        kwargs["automatic_tool_calling"] = bool(native_workspace_tools)
+
+    if native_workspace_tools and "tool_event_handler" in parameters:
+        kwargs["tool_event_handler"] = WorkspaceToolEventHandler()
 
     if (
-        tool_definitions
+        (tool_definitions or native_workspace_tools)
         and ENABLE_CONSTRAINED_DECODING
         and "enable_constrained_decoding" in parameters
     ):

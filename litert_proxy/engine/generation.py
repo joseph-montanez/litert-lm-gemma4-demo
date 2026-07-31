@@ -95,6 +95,15 @@ def generation_events(
     cancel_event: threading.Event,
     state: GenerationState,
 ) -> Iterator[tuple[str, Any]]:
+    tool_event_handler = getattr(
+        conversation,
+        "tool_event_handler",
+        None,
+    )
+    reset_tool_budget = getattr(tool_event_handler, "reset", None)
+    if callable(reset_tool_budget):
+        reset_tool_budget()
+
     send_kwargs = build_send_kwargs(conversation, request)
     has_tools = bool(normalize_tool_definitions(request))
     include_reasoning = (

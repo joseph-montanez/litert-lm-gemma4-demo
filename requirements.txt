@@ -2,3 +2,4 @@ litert-lm>=0.14.0,<0.15
 fastapi>=0.116,<1
 uvicorn>=0.35,<1
 pydantic>=2,<3
+huggingface_hub>=0.20,<2
