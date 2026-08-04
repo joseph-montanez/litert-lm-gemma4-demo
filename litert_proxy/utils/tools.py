@@ -4,10 +4,7 @@ import re
 import uuid
 from typing import Any, Optional
 
-from ..config import (
-    ENABLE_CONSTRAINED_DECODING,
-    MAX_TOOL_ARGUMENT_STRING_LENGTH,
-)
+from .. import config
 from ..models import ChatCompletionRequest, MalformedToolCallError
 from .token import json_safe
 from .text import extract_litert_tool_calls
@@ -107,7 +104,7 @@ _PROTOCOL_LEAK_PATTERNS = (
 
 def value_contains_protocol_leak(value: Any) -> bool:
     if isinstance(value, str):
-        if len(value) > MAX_TOOL_ARGUMENT_STRING_LENGTH:
+        if len(value) > config.MAX_TOOL_ARGUMENT_STRING_LENGTH:
             return True
 
         return any(

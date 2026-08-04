@@ -1,14 +1,19 @@
 import queue
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from litert_proxy import config
 from litert_proxy.engine.worker import PersistentConversationWorker
-from litert_proxy.engine.generation import generation_events
+from litert_proxy.engine.generation import (
+    generation_events,
+    generation_events_blocking,
+)
 from litert_proxy.models import (
     ChatCompletionRequest,
     GenerationState,
     InferenceJob,
+    MalformedToolCallError,
 )
 
 
@@ -88,6 +93,121 @@ class CancellationTest(unittest.TestCase):
         self.assertTrue(worker.cancel_current())
         self.assertTrue(job.cancel_event.is_set())
         self.assertTrue(worker.status()["busy"])
+
+    def test_incomplete_native_tool_marker_is_retryable_not_visible_text(self):
+        class Conversation:
+            def send_message_async(self, *_args, **_kwargs):
+                return iter(("<|tool_call>",))
+
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "inspect files"}],
+            workspace_tools=True,
+            workspace_path="/tmp",
+        )
+
+        with self.assertRaisesRegex(
+            MalformedToolCallError,
+            "incomplete tool-call protocol",
+        ):
+            list(
+                generation_events(
+                    Conversation(),
+                    "inspect files",
+                    request,
+                    Mock(),
+                    threading.Event(),
+                    GenerationState(),
+                )
+            )
+
+    def test_native_workspace_tool_failure_retries_with_a_new_seed(self):
+        worker = PersistentConversationWorker(engine=object())
+        job = InferenceJob(
+            request=ChatCompletionRequest(
+                messages=[{"role": "user", "content": "inspect files"}],
+                workspace_tools=True,
+                workspace_path="/tmp",
+            ),
+            messages=[{"role": "user", "content": "inspect files"}],
+            result_queue=queue.Queue(),
+        )
+        processor = Mock(
+            side_effect=[
+                MalformedToolCallError("incomplete tool marker"),
+                None,
+            ]
+        )
+
+        with (
+            patch.object(
+                worker,
+                "_process_separate_tool_request",
+                processor,
+            ),
+            patch.object(config, "MALFORMED_TOOL_CALL_RETRIES", 1),
+        ):
+            worker._process(job)
+
+        self.assertEqual(processor.call_count, 2)
+        self.assertEqual(job.request.seed, 1)
+
+    def test_blocking_native_tool_generation_returns_final_text(self):
+        class Conversation:
+            def send_message_async(self, _message, *, max_output_tokens=None):
+                raise AssertionError("The async path must not be used.")
+
+            def send_message(self, _message, *, max_output_tokens=None):
+                return {"text": "workspace result"}
+
+        events = list(
+            generation_events_blocking(
+                Conversation(),
+                "inspect files",
+                ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "inspect files"}],
+                    workspace_tools=True,
+                    workspace_path="/tmp",
+                    reasoning_effort="none",
+                    max_tokens=128,
+                ),
+                Mock(),
+                threading.Event(),
+                GenerationState(),
+            )
+        )
+
+        self.assertEqual(events, [("text", "workspace result")])
+
+    def test_blocking_native_tool_generation_rejects_raw_marker(self):
+        class Conversation:
+            def send_message_async(self, _message, *, max_output_tokens=None):
+                raise AssertionError("The async path must not be used.")
+
+            def send_message(self, _message, *, max_output_tokens=None):
+                return {"text": "<|tool_call>"}
+
+        with self.assertRaisesRegex(
+            MalformedToolCallError,
+            "blocking automatic tool execution returned raw protocol",
+        ):
+            list(
+                generation_events_blocking(
+                    Conversation(),
+                    "inspect files",
+                    ChatCompletionRequest(
+                        messages=[
+                            {"role": "user", "content": "inspect files"}
+                        ],
+                        workspace_tools=True,
+                        workspace_path="/tmp",
+                        reasoning_effort="none",
+                        max_tokens=128,
+                    ),
+                    Mock(),
+                    threading.Event(),
+                    GenerationState(),
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
+import fnmatch
 import json
+import os
 import platform
 import re
 import subprocess
@@ -26,6 +28,7 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOOL_RESULT_CHARS = 50_000
 MAX_IDENTICAL_TOOL_CALLS = 2
 SHELL_APPROVAL_TIMEOUT_SECONDS = 300
+DEFAULT_EXCLUDED_DIRS = (".venv", ".git", "__pycache__")
 
 
 @dataclass
@@ -147,6 +150,83 @@ def _result(payload: Any) -> str:
     return text[:MAX_TOOL_RESULT_CHARS] + "\n... [tool result truncated]"
 
 
+def _exclude_dir_patterns(args: dict[str, Any]) -> list[str]:
+    raw_patterns = args.get("exclude_dirs", list(DEFAULT_EXCLUDED_DIRS))
+    if raw_patterns is None:
+        raw_patterns = list(DEFAULT_EXCLUDED_DIRS)
+    if not isinstance(raw_patterns, (list, tuple)):
+        raise ValueError("exclude_dirs must be an array of directory patterns.")
+
+    patterns = []
+    for raw_pattern in raw_patterns:
+        pattern = str(raw_pattern).strip().replace("\\", "/").strip("/")
+        if not pattern:
+            continue
+        if len(pattern) > 256:
+            raise ValueError("Directory exclusion patterns are limited to 256 characters.")
+        patterns.append(pattern)
+    return patterns
+
+
+def _glob_matches(relative_path: str, pattern: str) -> bool:
+    candidates = [pattern]
+    while candidates[-1].startswith("**/"):
+        candidates.append(candidates[-1][3:])
+    return any(
+        fnmatch.fnmatchcase(relative_path, candidate)
+        or Path(relative_path).match(candidate)
+        for candidate in candidates
+    )
+
+
+def _directory_is_excluded(
+    directory: Path,
+    search_root: Path,
+    patterns: list[str],
+) -> bool:
+    try:
+        relative_path = directory.relative_to(search_root).as_posix()
+    except ValueError:
+        return True
+
+    for pattern in patterns:
+        if "/" not in pattern and fnmatch.fnmatchcase(directory.name, pattern):
+            return True
+        if _glob_matches(relative_path, pattern):
+            return True
+    return False
+
+
+def _walk_workspace(
+    search_root: Path,
+    exclude_dirs: list[str],
+):
+    """Yield descendants while pruning excluded directory subtrees."""
+    for current, directory_names, file_names in os.walk(
+        search_root,
+        followlinks=False,
+    ):
+        current_path = Path(current)
+        directory_names.sort()
+        file_names.sort()
+        allowed_directories = []
+
+        for directory_name in directory_names:
+            directory = current_path / directory_name
+            if _directory_is_excluded(
+                directory,
+                search_root,
+                exclude_dirs,
+            ):
+                continue
+            allowed_directories.append(directory_name)
+            yield directory
+
+        directory_names[:] = allowed_directories
+        for file_name in file_names:
+            yield current_path / file_name
+
+
 class Workspace:
     def __init__(self, root: Path):
         self.root = root
@@ -225,12 +305,35 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
         self._workspace_root = workspace_root
         self._shell_approval_id = shell_approval_id
         self._lock = threading.Lock()
+        self._event_callback: Callable[[dict[str, Any]], None] | None = None
         self.reset()
 
     def reset(self):
         with self._lock:
             self._call_count = 0
             self._signature_counts: dict[str, int] = {}
+            self._pending_calls: list[dict[str, Any]] = []
+
+    def set_event_callback(
+        self,
+        callback: Callable[[dict[str, Any]], None] | None,
+    ):
+        """Forward automatic tool lifecycle events to the active request."""
+        with self._lock:
+            self._event_callback = callback
+
+    def _emit_event(self, event: dict[str, Any]):
+        with self._lock:
+            callback = self._event_callback
+
+        if callback is None:
+            return
+
+        try:
+            callback(event)
+        except Exception:
+            # UI progress reporting must never interrupt tool execution.
+            pass
 
     def set_shell_approval_id(self, shell_approval_id: str | None):
         """Update the per-request approval channel on reused conversations."""
@@ -277,6 +380,15 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
                 "Workspace tool-call limit exceeded for one generation."
             )
 
+        call_record = {
+            "id": str(tool_call.get("id") or f"workspace-tool-{call_count}"),
+            "index": call_count,
+            "limit": _config.MAX_TOOL_CALLS_PER_GENERATION,
+            "name": name,
+            "arguments": parsed_arguments,
+        }
+        self._emit_event({"phase": "call", **call_record})
+
         if name == "shell":
             command = (
                 str(parsed_arguments.get("command", "")).strip()
@@ -290,6 +402,11 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
                     file=sys.stderr,
                     flush=True,
                 )
+                self._emit_event({
+                    "phase": "denied",
+                    **call_record,
+                    "error": "Shell command arguments were missing or invalid.",
+                })
                 return False
             if not self._shell_approval_id or self._workspace_root is None:
                 print(
@@ -298,6 +415,11 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
                     file=sys.stderr,
                     flush=True,
                 )
+                self._emit_event({
+                    "phase": "denied",
+                    **call_record,
+                    "error": "No shell approval session was supplied.",
+                })
                 return False
 
             approved = shell_approval_broker.request(
@@ -311,11 +433,49 @@ class WorkspaceToolEventHandler(litert_lm.ToolEventHandler):
                 file=sys.stderr,
                 flush=True,
             )
-            return approved
+            if not approved:
+                self._emit_event({
+                    "phase": "denied",
+                    **call_record,
+                    "error": "Shell command was denied.",
+                })
+                return False
+
+        with self._lock:
+            self._pending_calls.append(call_record)
 
         return True
 
     def process_tool_response(self, tool_response: Any) -> Any:
+        with self._lock:
+            call_record = (
+                self._pending_calls.pop(0)
+                if self._pending_calls
+                else {
+                    "id": "workspace-tool-unknown",
+                    "index": None,
+                    "limit": _config.MAX_TOOL_CALLS_PER_GENERATION,
+                    "name": "<unknown>",
+                    "arguments": {},
+                }
+            )
+
+        if isinstance(tool_response, str):
+            result_text = tool_response
+        else:
+            result_text = json.dumps(
+                tool_response,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+
+        self._emit_event({
+            "phase": "result",
+            **call_record,
+            "result": tool_response,
+            "truncated": "[Tool output truncated by LiteRT proxy:" in result_text,
+        })
         return tool_response
 
 
@@ -336,11 +496,26 @@ def build_workspace_tools(
         if Path(pattern).is_absolute():
             raise ValueError("Glob patterns must be relative to the workspace.")
         recursive = bool(args.get("recursive", False))
+        exclude_dirs = _exclude_dir_patterns(args)
 
-        glob_str = f"**/{pattern}" if recursive else pattern
         entries = []
+        candidates = (
+            _walk_workspace(path, exclude_dirs)
+            if recursive
+            else (
+                entry
+                for entry in sorted(path.iterdir(), key=lambda item: item.name)
+                if not (
+                    entry.is_dir()
+                    and _directory_is_excluded(entry, path, exclude_dirs)
+                )
+            )
+        )
 
-        for entry in path.glob(glob_str):
+        for entry in candidates:
+            relative_to_search = entry.relative_to(path).as_posix()
+            if not _glob_matches(relative_to_search, pattern):
+                continue
             try:
                 resolved = entry.resolve(strict=True)
             except (FileNotFoundError, OSError):
@@ -359,6 +534,7 @@ def build_workspace_tools(
         return _result({
             "entries": entries,
             "truncated": len(entries) >= MAX_LIST_RESULTS,
+            "excluded_dirs": exclude_dirs,
         })
 
     def grep_files(args: dict[str, Any]) -> str:
@@ -376,15 +552,23 @@ def build_workspace_tools(
 
         search_path = workspace.readable_path(str(args.get("path", ".")))
         file_glob = str(args.get("file_glob", "*")) or "*"
+        exclude_dirs = _exclude_dir_patterns(args)
         candidates = (
             [search_path]
             if search_path.is_file()
-            else search_path.rglob(file_glob)
+            else _walk_workspace(search_path, exclude_dirs)
         )
         matches = []
 
         for file_path in candidates:
             if not file_path.is_file():
+                continue
+            relative_to_search = (
+                file_path.name
+                if search_path.is_file()
+                else file_path.relative_to(search_path).as_posix()
+            )
+            if not _glob_matches(relative_to_search, file_glob):
                 continue
             try:
                 resolved = file_path.resolve(strict=True)
@@ -410,9 +594,14 @@ def build_workspace_tools(
                         return _result({
                             "matches": matches,
                             "truncated": True,
+                            "excluded_dirs": exclude_dirs,
                         })
 
-        return _result({"matches": matches, "truncated": False})
+        return _result({
+            "matches": matches,
+            "truncated": False,
+            "excluded_dirs": exclude_dirs,
+        })
 
     def read_file(args: dict[str, Any]) -> str:
         file_path = workspace.readable_path(
@@ -674,7 +863,7 @@ def build_workspace_tools(
     tools = [
         WorkspaceTool(
             "find",
-            "Find files and directories inside the workspace. Supports glob patterns and recursive search.",
+            "Find files and directories inside the workspace. Supports glob patterns, recursive search, and directory exclusions.",
             {
                 "type": "object",
                 "properties": {
@@ -689,6 +878,12 @@ def build_workspace_tools(
                     "recursive": {
                         "type": "boolean",
                         "description": "Recursively search descendants. When true, pattern is matched at any depth.",
+                    },
+                    "exclude_dirs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": list(DEFAULT_EXCLUDED_DIRS),
+                        "description": "Directory names or relative glob patterns to skip recursively. Defaults to .venv, .git, and __pycache__. Pass [] to include all directories.",
                     },
                 },
             },
@@ -713,6 +908,12 @@ def build_workspace_tools(
                         "description": "File glob such as '*.py'. Defaults to '*'.",
                     },
                     "ignore_case": {"type": "boolean"},
+                    "exclude_dirs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": list(DEFAULT_EXCLUDED_DIRS),
+                        "description": "Directory names or relative glob patterns to skip recursively. Defaults to .venv, .git, and __pycache__. Pass [] to include all directories.",
+                    },
                 },
                 "required": ["pattern"],
             },

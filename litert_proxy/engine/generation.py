@@ -1,12 +1,17 @@
 import sys
 import threading
+import time
 from typing import Any, Iterator, Optional
 
 from ..config import (
     INFERENCE_TIMEOUT_SECONDS,
     _console_lock,
 )
-from ..models import ChatCompletionRequest, GenerationState
+from ..models import (
+    ChatCompletionRequest,
+    GenerationState,
+    MalformedToolCallError,
+)
 from .progress import ConsoleProgress
 from .sampling import (
     build_send_kwargs,
@@ -87,6 +92,120 @@ def process_final_response(
         state.repetition_stopped = True
 
 
+def generation_events_blocking(
+    conversation: Any,
+    input_message: Any,
+    request: ChatCompletionRequest,
+    progress: ConsoleProgress,
+    cancel_event: threading.Event,
+    state: GenerationState,
+) -> Iterator[tuple[str, Any]]:
+    """Run LiteRT's complete automatic workspace-tool loop synchronously.
+
+    The CPU E4B runtime can terminate its async iterator immediately after the
+    ``<|tool_call>`` control token. The blocking API keeps tool parsing and
+    automatic execution inside LiteRT until a final response is available.
+    """
+    if cancel_event.is_set():
+        state.cancelled = True
+        return
+
+    tool_event_handler = getattr(
+        conversation,
+        "tool_event_handler",
+        None,
+    )
+    set_shell_approval_id = getattr(
+        tool_event_handler,
+        "set_shell_approval_id",
+        None,
+    )
+    if callable(set_shell_approval_id):
+        set_shell_approval_id(request.workspace_shell_approval_id)
+    reset_tool_budget = getattr(tool_event_handler, "reset", None)
+    if callable(reset_tool_budget):
+        reset_tool_budget()
+
+    send_kwargs = build_send_kwargs(conversation, request)
+    timed_out = threading.Event()
+
+    def cancel_for_timeout():
+        timed_out.set()
+        cancel_event.set()
+        try:
+            conversation.cancel_process()
+        except Exception:
+            pass
+
+    timeout_timer: Optional[threading.Timer] = None
+    if INFERENCE_TIMEOUT_SECONDS > 0:
+        timeout_timer = threading.Timer(
+            INFERENCE_TIMEOUT_SECONDS,
+            cancel_for_timeout,
+        )
+        timeout_timer.daemon = True
+        timeout_timer.start()
+
+    try:
+        with _console_lock:
+            print(
+                "\n[generation-mode] blocking native workspace tools",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        blocking_started_at = time.perf_counter()
+        response = conversation.send_message(
+            input_message,
+            **send_kwargs,
+        )
+        progress.set_blocking_generation_timing(
+            blocking_started_at,
+            time.perf_counter(),
+        )
+
+        if timed_out.is_set():
+            state.cancelled = True
+            raise TimeoutError(
+                "LiteRT inference exceeded "
+                f"{INFERENCE_TIMEOUT_SECONDS:.0f} seconds "
+                "and was cancelled."
+            )
+        if cancel_event.is_set():
+            state.cancelled = True
+            return
+
+        progress.observe_stream_chunk()
+        blocking_text = extract_text(response)
+        if (
+            request.workspace_tools
+            and looks_like_tool_protocol(blocking_text)
+        ):
+            raise MalformedToolCallError(
+                "LiteRT blocking automatic tool execution returned raw "
+                f"protocol text: {blocking_text[:160]!r}."
+            )
+
+        emitted = False
+        for event, payload in process_final_response(
+            response,
+            request,
+            progress,
+            state,
+        ):
+            emitted = True
+            yield event, payload
+
+        if not emitted:
+            raise RuntimeError(
+                "LiteRT blocking workspace-tool generation completed "
+                "without assistant text or a tool call."
+            )
+    finally:
+        if timeout_timer is not None:
+            timeout_timer.cancel()
+
+
 def generation_events(
     conversation: Any,
     input_message: Any,
@@ -116,7 +235,10 @@ def generation_events(
         reset_tool_budget()
 
     send_kwargs = build_send_kwargs(conversation, request)
-    has_tools = bool(normalize_tool_definitions(request))
+    has_tools = bool(
+        request.workspace_tools
+        or normalize_tool_definitions(request)
+    )
     include_reasoning = (
         request.include_reasoning
         if request.include_reasoning is not None
@@ -325,7 +447,10 @@ def generation_events(
             return
 
         if tool_protocol_buffer:
-            yield from emit_visible(tool_protocol_buffer)
+            raise MalformedToolCallError(
+                "The model emitted an incomplete tool-call protocol: "
+                f"{tool_protocol_buffer[:160]!r}."
+            )
 
         if not emitted_text and not emitted_reasoning and not state.tool_calls:
             with _console_lock:

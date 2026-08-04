@@ -40,8 +40,27 @@ MODEL_REGISTRY = {
         # The published desktop bundle declares a GPU main-backend
         # constraint; no CPU variant is currently available.
         "backend": "gpu",
+        # LiteRT-LM's normal WebGPU prefill path has a 20-second tensor
+        # readback deadline. Benchmark mode makes prefill wait and retry until
+        # the GPU finishes, which is required for uncached 12B prompts that
+        # take longer than that deadline.
+        "enable_benchmark": True,
         "max_num_tokens": 32768,
         "default_max_output_tokens": 4096,
+        "runtime_defaults": {
+            "DEFAULT_MAX_OUTPUT_TOKENS": 4096,
+            "MAX_TOOL_RESPONSE_TOKENS": 4096,
+            "DEFAULT_TEMPERATURE": 0.8,
+            "DEFAULT_TOP_P": 0.9,
+            "DEFAULT_TOP_K": 40,
+            "DEFAULT_REASONING_EFFORT": "none",
+            "DEFAULT_REPETITION_PENALTY": 1.1,
+            "MALFORMED_TOOL_CALL_RETRIES": 2,
+            "MAX_TOOL_ARGUMENT_STRING_LENGTH": 4096,
+            "MAX_TOOL_CALLS_PER_GENERATION": 12,
+            "ENABLE_CONSTRAINED_DECODING": True,
+            "ENABLE_SPECULATIVE_DECODING": False,
+        },
     },
 }
 
@@ -50,6 +69,44 @@ CURRENT_MODEL_KEY: str | None = None
 
 # Directory where registry models are stored.
 _MODELS_DIR = os.path.join(os.path.expanduser("~"), ".litert-lm", "models")
+
+# Optional second runtime used for native workspace tools. Automatic native
+# tool execution is disabled for the 12B primary by default; client-supplied
+# OpenAI tools still run through 12B for execution by the external client. The
+# experimental override keeps the E4B fallback on CPU so it does not share the
+# WebGPU device with the larger primary model on macOS.
+TOOL_ROUTING_ENABLED = os.environ.get(
+    "LITERT_TOOL_ROUTING_ENABLED",
+    "1",
+).strip().lower() not in {"0", "false", "no", "off"}
+TOOL_ROUTE_OPENAI_TOOLS = os.environ.get(
+    "LITERT_TOOL_ROUTE_OPENAI_TOOLS",
+    "0",
+).strip().lower() not in {"0", "false", "no", "off"}
+ENABLE_12B_TOOLS = os.environ.get(
+    "LITERT_ENABLE_12B_TOOLS",
+    "0",
+).strip().lower() not in {"0", "false", "no", "off"}
+TOOL_MODEL_KEY = os.environ.get(
+    "LITERT_TOOL_MODEL_KEY",
+    "gemma-4-E4B-it",
+).strip()
+TOOL_MODEL_PATH = os.environ.get(
+    "LITERT_TOOL_MODEL_PATH",
+    os.path.join(_MODELS_DIR, f"{TOOL_MODEL_KEY}.litertlm"),
+)
+TOOL_BACKEND = os.environ.get(
+    "LITERT_TOOL_BACKEND",
+    "cpu",
+).strip().lower()
+TOOL_MAX_NUM_TOKENS = int(
+    os.environ.get("LITERT_TOOL_MAX_NUM_TOKENS", "8192")
+)
+TOOL_REASONING_EFFORT = os.environ.get(
+    "LITERT_TOOL_REASONING_EFFORT",
+    "none",
+).strip().lower()
+TOOL_MODEL_LOAD_ERROR: str | None = None
 MAX_NUM_TOKENS = int(os.environ.get("LITERT_MAX_NUM_TOKENS", "131072"))
 DEFAULT_MAX_OUTPUT_TOKENS = int(
     os.environ.get("LITERT_MAX_OUTPUT_TOKENS", "32768")
@@ -100,9 +157,11 @@ THINKING_TOKEN_BUDGETS = {
 DEFAULT_TOOL_TEMPERATURE = float(
     os.environ.get("LITERT_TOOL_TEMPERATURE", "0.6")
 )
-DEFAULT_TOP_P = 0.95
-DEFAULT_TOP_K = 64
-DEFAULT_REPETITION_PENALTY = 1.12
+DEFAULT_TOP_P = float(os.environ.get("LITERT_TOP_P", "0.95"))
+DEFAULT_TOP_K = int(os.environ.get("LITERT_TOP_K", "64"))
+DEFAULT_REPETITION_PENALTY = float(
+    os.environ.get("LITERT_REPETITION_PENALTY", "1.12")
+)
 DEFAULT_NO_REPEAT_NGRAM_SIZE = 6
 DEFAULT_REPETITION_WINDOW = 256
 
@@ -145,8 +204,55 @@ ENABLE_SPECULATIVE_DECODING = os.environ.get(
     "0",
 ).strip().lower() not in {"0", "false", "no", "off"}
 
+# Values restored before applying a model-specific runtime profile. Explicit
+# environment variables always win over the built-in profile.
+_RUNTIME_DEFAULT_BASELINES = {
+    "DEFAULT_MAX_OUTPUT_TOKENS": DEFAULT_MAX_OUTPUT_TOKENS,
+    "MAX_TOOL_RESPONSE_TOKENS": MAX_TOOL_RESPONSE_TOKENS,
+    "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
+    "DEFAULT_TOP_P": DEFAULT_TOP_P,
+    "DEFAULT_TOP_K": DEFAULT_TOP_K,
+    "DEFAULT_REASONING_EFFORT": DEFAULT_REASONING_EFFORT,
+    "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
+    "MALFORMED_TOOL_CALL_RETRIES": MALFORMED_TOOL_CALL_RETRIES,
+    "MAX_TOOL_ARGUMENT_STRING_LENGTH": MAX_TOOL_ARGUMENT_STRING_LENGTH,
+    "MAX_TOOL_CALLS_PER_GENERATION": MAX_TOOL_CALLS_PER_GENERATION,
+    "ENABLE_CONSTRAINED_DECODING": ENABLE_CONSTRAINED_DECODING,
+    "ENABLE_SPECULATIVE_DECODING": ENABLE_SPECULATIVE_DECODING,
+}
+_RUNTIME_DEFAULT_ENV_VARS = {
+    "DEFAULT_MAX_OUTPUT_TOKENS": "LITERT_MAX_OUTPUT_TOKENS",
+    "MAX_TOOL_RESPONSE_TOKENS": "LITERT_MAX_TOOL_RESPONSE_TOKENS",
+    "DEFAULT_TEMPERATURE": "LITERT_TEMPERATURE",
+    "DEFAULT_TOP_P": "LITERT_TOP_P",
+    "DEFAULT_TOP_K": "LITERT_TOP_K",
+    "DEFAULT_REASONING_EFFORT": "LITERT_REASONING_EFFORT",
+    "DEFAULT_REPETITION_PENALTY": "LITERT_REPETITION_PENALTY",
+    "MALFORMED_TOOL_CALL_RETRIES": "LITERT_MALFORMED_TOOL_RETRIES",
+    "MAX_TOOL_ARGUMENT_STRING_LENGTH": "LITERT_MAX_TOOL_ARGUMENT_LENGTH",
+    "MAX_TOOL_CALLS_PER_GENERATION": "LITERT_MAX_TOOL_CALLS_PER_GENERATION",
+    "ENABLE_CONSTRAINED_DECODING": "LITERT_CONSTRAINED_DECODING",
+    "ENABLE_SPECULATIVE_DECODING": "LITERT_SPECULATIVE_DECODING",
+}
+
+
+def apply_model_runtime_defaults(model_key: str | None) -> None:
+    """Restore baseline defaults, then apply the selected model's profile."""
+    for name, value in _RUNTIME_DEFAULT_BASELINES.items():
+        globals()[name] = value
+
+    entry = MODEL_REGISTRY.get(model_key, {}) if model_key else {}
+    profile = entry.get("runtime_defaults", {})
+    for name, value in profile.items():
+        environment_name = _RUNTIME_DEFAULT_ENV_VARS.get(name)
+        if environment_name and environment_name in os.environ:
+            continue
+        globals()[name] = value
+
 engine = None
 conversation_worker = None
+tool_engine = None
+tool_conversation_worker = None
 MODEL_LOADING = False
 MODEL_LOAD_ERROR: str | None = None
 

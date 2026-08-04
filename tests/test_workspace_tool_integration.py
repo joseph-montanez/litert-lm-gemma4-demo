@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from litert_proxy.engine.sampling import (
     build_conversation_kwargs,
+    build_send_kwargs,
     conversation_config_signature,
 )
 from litert_proxy.models import ChatCompletionRequest
@@ -21,6 +22,7 @@ class FakeEngine:
         sampler_config=None,
         enable_constrained_decoding=False,
         tool_event_handler=None,
+        max_output_tokens=None,
     ):
         raise AssertionError("This signature is inspected, not called.")
 
@@ -47,6 +49,73 @@ class WorkspaceToolIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(kwargs["automatic_tool_calling"])
         self.assertIn("tool_event_handler", kwargs)
+
+    def test_conversation_kwargs_can_inspect_a_routed_engine(self):
+        with tempfile.TemporaryDirectory() as root:
+            request = self.request(root)
+            with patch("litert_proxy.config.engine", object()):
+                kwargs = build_conversation_kwargs(
+                    request,
+                    [],
+                    FakeEngine(),
+                )
+
+        self.assertTrue(kwargs["automatic_tool_calling"])
+
+    def test_output_limit_is_configured_on_the_conversation(self):
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=123,
+        )
+
+        kwargs = build_conversation_kwargs(request, [], FakeEngine())
+
+        self.assertEqual(kwargs["max_output_tokens"], 123)
+
+    def test_output_limit_is_not_repeated_per_message(self):
+        class Conversation:
+            _engine = FakeEngine()
+
+            def send_message_async(self, message, *, max_output_tokens=None):
+                raise AssertionError("This signature is inspected, not called.")
+
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=123,
+        )
+
+        kwargs = build_send_kwargs(Conversation(), request)
+
+        self.assertNotIn("max_output_tokens", kwargs)
+
+    def test_old_runtime_keeps_per_message_output_limit_fallback(self):
+        class Conversation:
+            def send_message_async(self, message, *, max_output_tokens=None):
+                raise AssertionError("This signature is inspected, not called.")
+
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=123,
+        )
+
+        kwargs = build_send_kwargs(Conversation(), request)
+
+        self.assertEqual(kwargs["max_output_tokens"], 123)
+
+    def test_native_tools_force_constrained_decoding(self):
+        with tempfile.TemporaryDirectory() as root:
+            request = self.request(root)
+            with patch(
+                "litert_proxy.config.ENABLE_CONSTRAINED_DECODING",
+                False,
+            ):
+                kwargs = build_conversation_kwargs(
+                    request,
+                    [],
+                    FakeEngine(),
+                )
+
+        self.assertTrue(kwargs["enable_constrained_decoding"])
 
     def test_shell_approval_session_reaches_tool_event_handler(self):
         with tempfile.TemporaryDirectory() as root:

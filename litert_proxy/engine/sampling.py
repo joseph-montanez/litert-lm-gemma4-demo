@@ -6,15 +6,10 @@ from typing import Any, Optional
 import litert_lm
 from fastapi import HTTPException
 
+from .. import config
 from ..config import (
-    DEFAULT_REASONING_EFFORT,
-    DEFAULT_REPETITION_PENALTY,
     DEFAULT_REPETITION_WINDOW,
     DEFAULT_NO_REPEAT_NGRAM_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
-    ENABLE_CONSTRAINED_DECODING,
     THINKING_TOKEN_BUDGETS,
     _console_lock,
 )
@@ -42,7 +37,7 @@ def build_sampler_config(request: ChatCompletionRequest):
     requested_temperature = (
         request.temperature
         if request.temperature is not None
-        else DEFAULT_TEMPERATURE
+        else config.DEFAULT_TEMPERATURE
     )
     effective_temperature = requested_temperature
 
@@ -50,12 +45,12 @@ def build_sampler_config(request: ChatCompletionRequest):
         "top_k": (
             request.top_k
             if request.top_k is not None
-            else DEFAULT_TOP_K
+            else config.DEFAULT_TOP_K
         ),
         "top_p": (
             request.top_p
             if request.top_p is not None
-            else DEFAULT_TOP_P
+            else config.DEFAULT_TOP_P
         ),
         "temperature": effective_temperature,
     }
@@ -79,7 +74,7 @@ def normalize_reasoning_effort(
     value = (
         request.reasoning_effort
         if request.reasoning_effort is not None
-        else DEFAULT_REASONING_EFFORT
+        else config.DEFAULT_REASONING_EFFORT
     )
 
     value = str(value).strip().lower()
@@ -192,17 +187,17 @@ def conversation_config_signature(
         "temperature": (
             request.temperature
             if request.temperature is not None
-            else DEFAULT_TEMPERATURE
+            else config.DEFAULT_TEMPERATURE
         ),
         "top_p": (
             request.top_p
             if request.top_p is not None
-            else DEFAULT_TOP_P
+            else config.DEFAULT_TOP_P
         ),
         "top_k": (
             request.top_k
             if request.top_k is not None
-            else DEFAULT_TOP_K
+            else config.DEFAULT_TOP_K
         ),
         "seed": request.seed,
         "reasoning_effort": normalize_reasoning_effort(request),
@@ -238,13 +233,21 @@ def conversation_config_signature(
 def build_conversation_kwargs(
     request: ChatCompletionRequest,
     initial_messages: list[Any],
+    engine: Any = None,
 ) -> dict[str, Any]:
     from .. import config as _sampling_cfg
 
-    parameters = set(inspect.signature(_sampling_cfg.engine.create_conversation).parameters)
+    active_engine = engine if engine is not None else _sampling_cfg.engine
+    parameters = set(inspect.signature(active_engine.create_conversation).parameters)
     kwargs: dict[str, Any] = {
         "messages": initial_messages,
     }
+
+    if "max_output_tokens" in parameters:
+        # LiteRT-LM 0.15's Gemma 4 12B GPU path can time out while reading
+        # tensors back when this limit is supplied as a per-message optional
+        # argument. The equivalent session-level setting streams normally.
+        kwargs["max_output_tokens"] = requested_output_tokens(request)
 
     if "sampler_config" in parameters:
         sampler_config = build_sampler_config(request)
@@ -306,12 +309,14 @@ def build_conversation_kwargs(
             shell_approval_id=request.workspace_shell_approval_id,
         )
 
-    if (
-        (tool_definitions or native_workspace_tools)
-        and ENABLE_CONSTRAINED_DECODING
-        and "enable_constrained_decoding" in parameters
-    ):
-        kwargs["enable_constrained_decoding"] = True
+    if "enable_constrained_decoding" in parameters:
+        if native_workspace_tools:
+            # LiteRT automatic tool execution requires the model to finish a
+            # structured call. Without constrained decoding, Gemma can emit
+            # only the raw <|tool_call> control marker and stop.
+            kwargs["enable_constrained_decoding"] = True
+        elif tool_definitions and _sampling_cfg.ENABLE_CONSTRAINED_DECODING:
+            kwargs["enable_constrained_decoding"] = True
 
     enabled = thinking_enabled(request)
 
@@ -355,10 +360,31 @@ def build_send_kwargs(
     )
     kwargs: dict[str, Any] = {}
 
-    output_limit = requested_output_tokens(request)
+    active_engine = getattr(conversation, "_engine", None)
+    create_conversation = getattr(
+        active_engine,
+        "create_conversation",
+        None,
+    )
+    conversation_has_output_limit = False
 
-    if "max_output_tokens" in parameters:
-        kwargs["max_output_tokens"] = output_limit
+    if callable(create_conversation):
+        try:
+            conversation_has_output_limit = (
+                "max_output_tokens"
+                in inspect.signature(create_conversation).parameters
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if (
+        "max_output_tokens" in parameters
+        and not conversation_has_output_limit
+    ):
+        # Compatibility fallback for older LiteRT-LM conversations. Newer
+        # runtimes receive the limit in build_conversation_kwargs() because
+        # the 12B GPU executor is unstable with the per-message override.
+        kwargs["max_output_tokens"] = requested_output_tokens(request)
 
     repetition_type = getattr(
         litert_lm,
@@ -379,7 +405,7 @@ def build_send_kwargs(
             repetition_kwargs["repetition_penalty"] = (
                 request.repetition_penalty
                 if request.repetition_penalty is not None
-                else DEFAULT_REPETITION_PENALTY
+                else config.DEFAULT_REPETITION_PENALTY
             )
 
         if (

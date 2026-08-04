@@ -97,6 +97,28 @@ def make_stream_tool_calls_chunk(
     return f"data: {json.dumps(chunk)}\n\n"
 
 
+def make_stream_tool_activity_chunk(
+    model_name: str,
+    activity: dict[str, Any],
+) -> str:
+    """Return a proxy extension event for automatic workspace tools."""
+    chunk = {
+        "id": "chatcmpl-litert",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"tool_activity": activity},
+                "finish_reason": None,
+            }
+        ],
+    }
+
+    return f"data: {json.dumps(chunk, default=str)}\n\n"
+
+
 def make_initial_stream_chunk(model_name: str) -> str:
     chunk = {
         "id": "chatcmpl-litert",

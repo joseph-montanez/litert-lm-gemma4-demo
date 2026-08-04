@@ -3,12 +3,7 @@ import sys
 from typing import Any
 
 from .. import config as _cfg
-from ..config import (
-    MAX_TOOL_RESPONSE_TOKENS,
-    ANTI_REPEAT_INSTRUCTION,
-    CONTEXT_SAFETY_MARGIN_TOKENS,
-    _console_lock,
-)
+from ..config import ANTI_REPEAT_INSTRUCTION, _console_lock
 
 # ---------------------------------------------------------------------------
 # Low-level content utilities (used by both token estimation and message
@@ -167,7 +162,8 @@ def truncate_text_to_token_limit(
 
 
 def truncate_tool_content(content: Any) -> Any:
-    if MAX_TOOL_RESPONSE_TOKENS <= 0 or content is None:
+    token_limit = _cfg.MAX_TOOL_RESPONSE_TOKENS
+    if token_limit <= 0 or content is None:
         return content
 
     if isinstance(content, str):
@@ -182,7 +178,7 @@ def truncate_tool_content(content: Any) -> Any:
 
     truncated, original_tokens, final_tokens = truncate_text_to_token_limit(
         serialized,
-        MAX_TOOL_RESPONSE_TOKENS,
+        token_limit,
     )
 
     if original_tokens != final_tokens:
@@ -298,13 +294,13 @@ def estimate_context_budget(
         message_tokens
         + tool_schema_tokens
         + output_tokens
-        + CONTEXT_SAFETY_MARGIN_TOKENS
+        + _cfg.CONTEXT_SAFETY_MARGIN_TOKENS
     )
 
     return {
         "message_tokens": message_tokens,
         "tool_schema_tokens": tool_schema_tokens,
         "output_tokens": output_tokens,
-        "safety_margin_tokens": CONTEXT_SAFETY_MARGIN_TOKENS,
+        "safety_margin_tokens": _cfg.CONTEXT_SAFETY_MARGIN_TOKENS,
         "projected_tokens": projected_tokens,
     }

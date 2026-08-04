@@ -86,6 +86,54 @@ GET  http://localhost:8000/docs
 
 The server has no authentication or TLS. Do not expose it directly to the public Internet.
 
+### Tool routing on macOS
+
+Gemma 4 E2B and E4B can use tools. When E4B is the primary model, native
+workspace tools reuse that engine, so only one model instance is loaded.
+
+Native workspace tooling is disabled by default when Gemma 4 12B is selected
+because this bundle does not reliably complete LiteRT's automatic server-side
+tool loop. The server does not load a second E4B instance in that configuration,
+and the web UI disables workspace tools. Client-supplied OpenAI function tools
+remain available on the primary 12B model so external Agent clients can execute
+those functions themselves.
+
+The built-in 12B profile keeps the 32,768-token context window and uses a
+4,096-token output limit, temperature `0.8`, Top-P `0.9`, Top-K `40`, reasoning
+disabled, repetition penalty `1.1`, and speculative decoding disabled. Explicit
+environment settings override the profile.
+
+Set `LITERT_ENABLE_12B_TOOLS=1` to opt into the experimental dual-model
+fallback. Native workspace tools then run on a dedicated Gemma 4 E4B engine
+using the CPU backend. Plain chat and, by default, client-supplied OpenAI
+function tools continue to use the selected primary model.
+
+The two runtimes share the server's single-request lock; they do not infer at
+the same time. If the E4B bundle is missing, the server downloads the registry
+model during startup. A tool-model load failure is reported by `/health`, but
+does not prevent ordinary primary-model chat from starting.
+
+E4B native workspace turns use LiteRT's blocking message API. LiteRT executes
+the complete automatic tool loop internally before the proxy reads the final
+response. SSE clients receive keep-alives while it runs and then receive the
+final answer; token-by-token streaming remains enabled for ordinary 12B chat
+and client-supplied OpenAI tools.
+
+Example for 12B chat with E4B workspace tools on macOS:
+
+```bash
+export LITERT_MODEL_PATH="$HOME/.litert-lm/models/gemma-4-12B-it.litertlm"
+export LITERT_ENABLE_12B_TOOLS=1
+export LITERT_MAX_NUM_TOKENS=32768
+export LITERT_TOOL_MAX_NUM_TOKENS=8192
+export LITERT_MAX_TOOL_RESPONSE_TOKENS=512
+python main.py
+```
+
+Changing models in the web UI tears down any no-longer-needed fallback runtime.
+Switching from the experimental 12B/E4B arrangement back to E4B therefore
+returns to a single engine.
+
 ## Command-line parameters
 
 ```text
@@ -187,6 +235,80 @@ $env:LITERT_CACHE_DIR = "C:\Users\Joseph Montanez\.litert-lm\cache"
 ```
 
 This is not the conversational KV cache. Conversation KV state remains in RAM/GPU memory and cannot currently be restored from this directory.
+
+#### `LITERT_TOOL_ROUTING_ENABLED`
+
+Routes requests containing native workspace tools to a second model runtime.
+Enabled by default. Set to `0` to run every request on the primary model.
+
+#### `LITERT_ENABLE_12B_TOOLS`
+
+Native server-side workspace tooling is disabled for Gemma 4 12B by default.
+Set this to `1` to explicitly enable it and the E4B fallback runtime. This does
+not affect client-supplied OpenAI function tools, which remain available on the
+primary 12B model. The default is `0`.
+
+#### `LITERT_TOOL_ROUTE_OPENAI_TOOLS`
+
+Set to `1` to route client-supplied OpenAI function tools to the dedicated E4B
+engine as well. Disabled by default because those calls are executed by the API
+client, not automatically inside LiteRT-LM, and should normally retain the
+primary model's context capacity.
+
+#### `LITERT_TOOL_MODEL_KEY`
+
+Registry key for the dedicated tool model. Default:
+
+```text
+gemma-4-E4B-it
+```
+
+Set this to `gemma-4-E2B-it` for a smaller, faster tool model with a likely
+tradeoff in tool-selection and argument accuracy.
+
+#### `LITERT_TOOL_MODEL_PATH`
+
+Optional path to the dedicated tool-model bundle. Default:
+
+```text
+~/.litert-lm/models/gemma-4-E4B-it.litertlm
+```
+
+#### `LITERT_TOOL_BACKEND`
+
+Backend for the dedicated tool model. Default:
+
+```text
+cpu
+```
+
+Using CPU keeps E4B off the WebGPU device occupied by the 12B primary model.
+
+#### `LITERT_TOOL_MAX_NUM_TOKENS`
+
+Maximum context capacity for the dedicated tool engine. The effective value is
+also capped by `LITERT_MAX_NUM_TOKENS`. Default:
+
+```text
+8192
+```
+
+#### `LITERT_TOOL_REASONING_EFFORT`
+
+Reasoning policy used only by the dedicated tool model. Default:
+
+```text
+none
+```
+
+This is intentionally independent of the primary model's reasoning setting.
+E4B automatic workspace tools are substantially more reliable without a
+thinking channel; 12B tool-free chat can still use `high` reasoning.
+
+#### `LITERT_TOOL_CACHE_DIR`
+
+Optional compiled-model cache directory for the dedicated tool engine. The
+default is the parent directory of `LITERT_TOOL_MODEL_PATH`.
 
 ### Context and output limits
 
@@ -563,8 +685,8 @@ The built-in web chat has a **Workspace tools** control above the prompt. Enter
 an absolute folder path and leave **Read only** enabled to give the model these
 automatically executed LiteRT-LM tools:
 
-- `find`: find files and directories by path or glob pattern
-- `grep`: search text files with a regular expression
+- `find`: find files and directories by path or glob pattern, with recursive directory exclusions
+- `grep`: search text files with a regular expression, with recursive directory exclusions
 - `read`: read bounded line ranges from UTF-8 text files
 - `line_count`: count the lines in a UTF-8 text file
 - `size`, `sort`, `head`, `tail`, and `platform`: bounded inspection helpers
@@ -588,6 +710,11 @@ searches, result counts, and writes are bounded to protect the model context and
 server process. Approved shell commands are the exception: the selected folder
 is only their initial working directory.
 
+`find` and `grep` skip `.venv`, `.git`, and `__pycache__` directories by
+default. Their `exclude_dirs` array accepts additional directory names or
+relative glob patterns; passing an empty array opts into searching every
+directory.
+
 API example:
 
 ```json
@@ -609,6 +736,11 @@ API example:
 Native workspace tools cannot be combined with client-supplied OpenAI `tools`
 in one request. The former execute inside LiteRT-LM; the latter are returned to
 the API client for execution.
+
+During automatic execution, the web chat shows a live card for each tool call,
+including its arguments and status. When execution completes, the card exposes
+the exact response passed back into the model. Large responses remain collapsed
+and are marked when the per-result token limit truncated them.
 
 ### Compacting a long web chat
 
@@ -636,6 +768,7 @@ Returns:
 - disk cache directory
 - constrained-decoding state
 - selected tool-context mode
+- dedicated tool-routing model, backend, load error, and worker status
 - current conversation-cache status
 - malformed-call safeguards
 - estimated current conversation tokens, including prompt and generated tokens
@@ -716,7 +849,12 @@ Example:
 [abc12345] done | cache=reuse | total≈8,950 | prefill≈7 | cached≈8,943 | output=59 | TTFT=2.87s
 ```
 
-For synchronous tool responses, the displayed decode rate can be artificially high because the complete response arrives before it is measured.
+Native automatic tool execution uses LiteRT's blocking API, which does not
+expose a trustworthy first-token boundary. For those requests, the web UI shows
+total wall-clock time and `E2E` throughput (final output tokens divided by the
+complete tool-run time), and explicitly marks separate prefill PPS and decode
+TPS as unavailable. Ordinary asynchronous chat continues to show TTFT, PPS,
+and TPS.
 
 ## Tool-context mode details
 
@@ -827,6 +965,11 @@ Get-Process python,py -ErrorAction SilentlyContinue | Stop-Process -Force
 ### GPU stops working during a large request
 
 Check the printed context budget. Large tool results can push the effective prompt near the engine limit even when the visible chat history appears smaller.
+
+Gemma 4 12B also needs LiteRT-LM's synchronous benchmark prefill path on GPU.
+The server enables it automatically. An uncached prompt can legitimately spend
+more than 20 seconds prefilling; the HTTP stream remains open and LiteRT retries
+GPU completion rather than returning an internal tensor-buffer error.
 
 ### Every tool call prefills the entire history
 

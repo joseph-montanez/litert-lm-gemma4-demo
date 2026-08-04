@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
+from litert_proxy.engine.streaming import make_stream_tool_activity_chunk
 from litert_proxy.workspace_tools import (
     build_workspace_tools,
     resolve_workspace_root,
@@ -89,6 +90,108 @@ class WorkspaceToolsTest(unittest.TestCase):
             {"path": "src/app.py"},
         )
         self.assertEqual(counted["lines"], 3)
+
+    def test_find_excludes_common_generated_directories_by_default(self):
+        for directory in (".venv", ".git", "__pycache__"):
+            ignored = self.root / directory
+            ignored.mkdir()
+            (ignored / "ignored.py").write_text(
+                "ignored = True\n",
+                encoding="utf-8",
+            )
+
+        result = self.execute(
+            self.tools()["find"],
+            {"pattern": "**/*.py", "recursive": True},
+        )
+        paths = {entry["path"] for entry in result["entries"]}
+
+        self.assertIn("src/app.py", paths)
+        self.assertFalse(any("ignored.py" in path for path in paths))
+        self.assertEqual(
+            result["excluded_dirs"],
+            [".venv", ".git", "__pycache__"],
+        )
+
+    def test_find_allows_custom_exclusions_and_empty_override(self):
+        vendor = self.root / "vendor"
+        vendor.mkdir()
+        (vendor / "vendored.py").write_text("value = 1\n", encoding="utf-8")
+        virtualenv = self.root / ".venv"
+        virtualenv.mkdir()
+        (virtualenv / "dependency.py").write_text(
+            "value = 2\n",
+            encoding="utf-8",
+        )
+
+        excluded = self.execute(
+            self.tools()["find"],
+            {
+                "pattern": "**/*.py",
+                "recursive": True,
+                "exclude_dirs": ["vendor", ".venv"],
+            },
+        )
+        included = self.execute(
+            self.tools()["find"],
+            {
+                "pattern": "**/*.py",
+                "recursive": True,
+                "exclude_dirs": [],
+            },
+        )
+
+        self.assertNotIn(
+            "vendor/vendored.py",
+            {entry["path"] for entry in excluded["entries"]},
+        )
+        included_paths = {entry["path"] for entry in included["entries"]}
+        self.assertIn("vendor/vendored.py", included_paths)
+        self.assertIn(".venv/dependency.py", included_paths)
+
+    def test_grep_prunes_excluded_directories(self):
+        generated = self.root / "src" / "generated"
+        generated.mkdir()
+        (generated / "generated.py").write_text(
+            "needle generated\n",
+            encoding="utf-8",
+        )
+        cache = self.root / "src" / "__pycache__"
+        cache.mkdir()
+        (cache / "cached.py").write_text(
+            "needle cached\n",
+            encoding="utf-8",
+        )
+
+        result = self.execute(
+            self.tools()["grep"],
+            {
+                "pattern": "needle",
+                "file_glob": "*.py",
+                "exclude_dirs": ["generated", "__pycache__"],
+            },
+        )
+
+        self.assertEqual(
+            [match["path"] for match in result["matches"]],
+            ["src/app.py"],
+        )
+
+    def test_find_and_grep_schemas_document_exclude_dirs(self):
+        definitions = {
+            tool.name: tool.get_tool_description()["function"]
+            for tool in self.tools().values()
+        }
+
+        for name in ("find", "grep"):
+            exclude_schema = definitions[name]["parameters"]["properties"][
+                "exclude_dirs"
+            ]
+            self.assertEqual(exclude_schema["type"], "array")
+            self.assertEqual(
+                exclude_schema["default"],
+                [".venv", ".git", "__pycache__"],
+            )
 
     def test_sort_tool(self):
         tools = self.tools()
@@ -340,6 +443,43 @@ class WorkspaceToolsTest(unittest.TestCase):
         self.assertTrue(handler.approve_tool_call(find_call))
         with self.assertRaisesRegex(RuntimeError, "repeated"):
             handler.approve_tool_call(find_call)
+
+    def test_tool_lifecycle_events_include_arguments_and_returned_response(self):
+        handler = WorkspaceToolEventHandler()
+        events = []
+        handler.set_event_callback(events.append)
+        tool_call = {
+            "id": "call-1",
+            "function": {
+                "name": "find",
+                "arguments": {"path": ".", "pattern": "*.py"},
+            },
+        }
+
+        self.assertTrue(handler.approve_tool_call(tool_call))
+        response = '{"entries":["app.py"]}'
+        self.assertIs(handler.process_tool_response(response), response)
+
+        self.assertEqual(events[0]["phase"], "call")
+        self.assertEqual(events[0]["name"], "find")
+        self.assertEqual(
+            events[0]["arguments"],
+            {"path": ".", "pattern": "*.py"},
+        )
+        self.assertEqual(events[1]["phase"], "result")
+        self.assertEqual(events[1]["result"], response)
+        self.assertFalse(events[1]["truncated"])
+
+    def test_tool_activity_stream_chunk_uses_delta_extension(self):
+        chunk = make_stream_tool_activity_chunk(
+            "gemma-4-12B-it",
+            {"id": "call-1", "phase": "call", "name": "find"},
+        )
+        payload = json.loads(chunk.removeprefix("data: ").strip())
+
+        activity = payload["choices"][0]["delta"]["tool_activity"]
+        self.assertEqual(activity["name"], "find")
+        self.assertEqual(activity["phase"], "call")
 
 
 if __name__ == "__main__":

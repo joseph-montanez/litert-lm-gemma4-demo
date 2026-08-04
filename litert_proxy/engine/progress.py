@@ -12,6 +12,12 @@ from ..config import (
 from ..utils.token import count_tokens
 
 
+# LiteRT can buffer an entire response internally and then drain every callback
+# in a few microseconds.  A callback-drain rate above this ceiling is not a
+# meaningful model decode rate, so report honest end-to-end throughput instead.
+MAX_CREDIBLE_STREAM_DECODE_TPS = 1_000.0
+
+
 class ConsoleProgress:
     def __init__(
         self,
@@ -56,8 +62,7 @@ class ConsoleProgress:
         started_at: float,
         finished_at: float,
     ):
-        # Compatibility with earlier server revisions. The active generation
-        # path now uses send_message_async() for all requests.
+        # Native automatic workspace tools use LiteRT's blocking API.
         with self._state_lock:
             self.blocking_generation_started_at = started_at
             self.blocking_generation_finished_at = finished_at
@@ -143,6 +148,10 @@ class ConsoleProgress:
         generation_seconds = None
         generation_tps = None
         blocking_response = False
+        buffered_response = False
+        end_to_end_tps = (
+            generated_tokens / total_seconds if generated_tokens else None
+        )
 
         with self._state_lock:
             blocking_started_at = self.blocking_generation_started_at
@@ -159,16 +168,27 @@ class ConsoleProgress:
             )
             generation_tps = output_tokens / generation_seconds
         elif self.first_token_at is not None:
-            ttft = max(self.first_token_at - self.started_at, 0.000001)
-            prefill_tps = (
-                self.prefill_tokens / ttft if self.prefill_tokens else None
-            )
             decode_seconds = max(
                 self.finished_at - self.first_token_at,
                 0.000001,
             )
-            decode_tps = generated_tokens / decode_seconds
-            visible_tps = output_tokens / decode_seconds
+            raw_decode_tps = generated_tokens / decode_seconds
+            buffered_response = bool(
+                generated_tokens
+                and raw_decode_tps > MAX_CREDIBLE_STREAM_DECODE_TPS
+            )
+            if not buffered_response:
+                ttft = max(
+                    self.first_token_at - self.started_at,
+                    0.000001,
+                )
+                prefill_tps = (
+                    self.prefill_tokens / ttft
+                    if self.prefill_tokens
+                    else None
+                )
+                decode_tps = raw_decode_tps
+                visible_tps = output_tokens / decode_seconds
 
         parts = [
             f"[{self.request_id}] {status}",
@@ -186,6 +206,11 @@ class ConsoleProgress:
             parts.append(f"response={generation_seconds:.2f}s")
             parts.append(f"e2e={generation_tps:,.1f} tok/s")
             parts.append("decode=n/a (blocking tool response)")
+        elif buffered_response:
+            parts.append("delivery=buffered")
+            if end_to_end_tps is not None:
+                parts.append(f"E2E≈{end_to_end_tps:,.1f} tok/s")
+            parts.append("decode=n/a (callbacks drained after generation)")
         else:
             if ttft is not None:
                 parts.append(f"TTFT={ttft:.2f}s")
@@ -214,6 +239,8 @@ class ConsoleProgress:
             "prefill_tokens_per_second": prefill_tps,
             "decode_tokens_per_second": decode_tps,
             "visible_tokens_per_second": visible_tps,
+            "buffered_response": buffered_response,
+            "end_to_end_tokens_per_second": end_to_end_tps,
             "blocking_response": blocking_response,
             "generation_seconds": generation_seconds,
             "generation_tokens_per_second": generation_tps,

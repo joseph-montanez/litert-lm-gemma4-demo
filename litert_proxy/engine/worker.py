@@ -6,10 +6,7 @@ from typing import Any, Optional
 from fastapi import HTTPException
 
 from .. import config
-from ..config import (
-    MALFORMED_TOOL_CALL_RETRIES,
-    _console_lock,
-)
+from ..config import _console_lock
 from ..models import (
     ChatCompletionRequest,
     ConversationPlan,
@@ -17,7 +14,7 @@ from ..models import (
     InferenceJob,
     MalformedToolCallError,
 )
-from .generation import generation_events
+from .generation import generation_events, generation_events_blocking
 from ..utils.message import (
     assistant_response_matches,
     build_initial_messages,
@@ -40,12 +37,33 @@ from ..utils.token import (
 from ..utils.tools import normalize_tool_definitions
 
 
+def _set_tool_activity_callback(
+    conversation: Any,
+    result_queue: queue.Queue,
+    *,
+    enabled: bool,
+) -> None:
+    handler = getattr(conversation, "tool_event_handler", None)
+    setter = getattr(handler, "set_event_callback", None)
+    if not callable(setter):
+        return
+
+    callback = (
+        lambda activity: result_queue.put(("tool_activity", activity))
+        if enabled
+        else None
+    )
+    setter(callback)
+
+
 class PersistentConversationWorker:
-    def __init__(self):
+    def __init__(self, engine=None, *, name: str = "primary"):
+        self._engine = engine if engine is not None else config.engine
+        self._name = name
         self._jobs: queue.Queue = queue.Queue()
         self._thread = threading.Thread(
             target=self._run,
-            name="litert-conversation-worker",
+            name=f"litert-conversation-worker-{name}",
             daemon=True,
         )
         self._stop_event = threading.Event()
@@ -115,6 +133,7 @@ class PersistentConversationWorker:
             context_usage = dict(self._context_usage)
 
         return {
+            "runtime": self._name,
             "conversation_cached": self._conversation is not None,
             "active_conversation": self._active_conversation is not None,
             "cached_request_messages": len(self._last_request_messages),
@@ -163,7 +182,10 @@ class PersistentConversationWorker:
             except Exception as exc:
                 separate_tool_request = (
                     config.TOOL_CONTEXT_MODE == "separate"
-                    and bool(normalize_tool_definitions(job.request))
+                    and bool(
+                        job.request.workspace_tools
+                        or normalize_tool_definitions(job.request)
+                    )
                 )
 
                 if not separate_tool_request:
@@ -178,12 +200,15 @@ class PersistentConversationWorker:
         self._reset_conversation()
 
     def _process(self, job: InferenceJob):
-        has_tools = bool(normalize_tool_definitions(job.request))
+        has_tools = bool(
+            job.request.workspace_tools
+            or normalize_tool_definitions(job.request)
+        )
         separate_tools = (
             has_tools and config.TOOL_CONTEXT_MODE == "separate"
         )
         attempts = (
-            MALFORMED_TOOL_CALL_RETRIES + 1
+            config.MALFORMED_TOOL_CALL_RETRIES + 1
             if has_tools
             else 1
         )
@@ -221,11 +246,21 @@ class PersistentConversationWorker:
                 if attempt + 1 >= attempts:
                     raise
 
+                retry_seed = (
+                    job.request.seed
+                    if job.request.seed is not None
+                    else 0
+                ) + 1
+                job.request = job.request.model_copy(
+                    update={"seed": retry_seed}
+                )
+
                 with _console_lock:
                     print(
                         "\n[tool-call-retry] "
                         f"Rejected malformed call: {exc} "
-                        "Rebuilding the tool context and retrying once.",
+                        "Rebuilding the tool context and retrying with "
+                        f"seed={retry_seed}.",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -254,6 +289,7 @@ class PersistentConversationWorker:
         conversation_kwargs = build_conversation_kwargs(
             job.request,
             initial_messages,
+            self._engine,
         )
 
         progress = ConsoleProgress(
@@ -275,25 +311,42 @@ class PersistentConversationWorker:
             )
 
         try:
-            with config.engine.create_conversation(
+            with self._engine.create_conversation(
                 **conversation_kwargs
             ) as conversation:
                 self._active_conversation = conversation
-
-                for event, payload in generation_events(
+                _set_tool_activity_callback(
                     conversation,
-                    input_message,
-                    job.request,
-                    progress,
-                    job.cancel_event,
-                    state,
-                ):
-                    if event == "text":
-                        response_parts.append(payload)
-                    elif event == "reasoning":
-                        reasoning_parts.append(payload.get("text", ""))
+                    job.result_queue,
+                    enabled=job.request.workspace_tools,
+                )
 
-                    job.result_queue.put((event, payload))
+                try:
+                    generation = (
+                        generation_events_blocking
+                        if job.request.workspace_tools
+                        else generation_events
+                    )
+                    for event, payload in generation(
+                        conversation,
+                        input_message,
+                        job.request,
+                        progress,
+                        job.cancel_event,
+                        state,
+                    ):
+                        if event == "text":
+                            response_parts.append(payload)
+                        elif event == "reasoning":
+                            reasoning_parts.append(payload.get("text", ""))
+
+                        job.result_queue.put((event, payload))
+                finally:
+                    _set_tool_activity_callback(
+                        conversation,
+                        job.result_queue,
+                        enabled=False,
+                    )
 
             response_text = "".join(response_parts)
             reasoning_text = "".join(reasoning_parts)
@@ -393,8 +446,9 @@ class PersistentConversationWorker:
             conversation_kwargs = build_conversation_kwargs(
                 job.request,
                 plan.initial_messages or [],
+                self._engine,
             )
-            self._conversation = config.engine.create_conversation(
+            self._conversation = self._engine.create_conversation(
                 **conversation_kwargs
             )
             self._config_signature = config_signature
@@ -431,9 +485,20 @@ class PersistentConversationWorker:
         state = GenerationState()
         response_parts = []
         reasoning_parts = []
+        active_conversation = self._conversation
+        _set_tool_activity_callback(
+            active_conversation,
+            job.result_queue,
+            enabled=job.request.workspace_tools,
+        )
 
         try:
-            for event, payload in generation_events(
+            generation = (
+                generation_events_blocking
+                if job.request.workspace_tools
+                else generation_events
+            )
+            for event, payload in generation(
                 self._conversation,
                 plan.input_message,
                 job.request,
@@ -505,6 +570,12 @@ class PersistentConversationWorker:
             progress.finish("error")
             self._reset_conversation()
             raise
+        finally:
+            _set_tool_activity_callback(
+                active_conversation,
+                job.result_queue,
+                enabled=False,
+            )
 
     def _build_plan(
         self,

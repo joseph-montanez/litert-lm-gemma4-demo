@@ -15,21 +15,6 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from . import config
 from .config import (
-    CONTEXT_SAFETY_MARGIN_TOKENS,
-    DEFAULT_BACKEND,
-    DEFAULT_MAX_OUTPUT_TOKENS,
-    DEFAULT_REASONING_EFFORT,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
-    ENABLE_CONSTRAINED_DECODING,
-    ENABLE_SPECULATIVE_DECODING,
-    INFERENCE_TIMEOUT_SECONDS,
-    MALFORMED_TOOL_CALL_RETRIES,
-    MAX_NUM_TOKENS,
-    MAX_TOOL_ARGUMENT_STRING_LENGTH,
-    MAX_TOOL_CALLS_PER_GENERATION,
-    MAX_TOOL_RESPONSE_TOKENS,
     MODEL_PATH,
     MODEL_REGISTRY,
     SSE_HEARTBEAT_SECONDS,
@@ -42,6 +27,43 @@ from .config import (
     resolve_backend,
 )
 from .models import ChatCompletionRequest, InferenceJob
+
+
+tool_engine = config.tool_engine
+tool_conversation_worker = config.tool_conversation_worker
+
+
+def _primary_is_tool_model() -> bool:
+    return bool(
+        config.CURRENT_MODEL_KEY
+        and config.CURRENT_MODEL_KEY == config.TOOL_MODEL_KEY
+    )
+
+
+def _workspace_tooling_enabled_for_primary() -> bool:
+    return bool(
+        config.CURRENT_MODEL_KEY != "gemma-4-12B-it"
+        or config.ENABLE_12B_TOOLS
+    )
+
+
+def _apply_model_engine_options(
+    engine_kwargs: dict[str, Any],
+    engine_parameters: set[str],
+    model_key: str | None,
+    backend: Any,
+) -> None:
+    """Apply model-specific LiteRT engine compatibility options."""
+    model_profile = MODEL_REGISTRY.get(model_key, {}) if model_key else {}
+    if (
+        model_profile.get("enable_benchmark")
+        and type(backend).__name__.upper() == "GPU"
+        and "enable_benchmark" in engine_parameters
+    ):
+        # LiteRT's benchmark prefill explicitly waits for GPU completion. That
+        # selects its retrying readback path instead of aborting when a large
+        # uncached prefill exceeds WebGPU's first 20-second wait interval.
+        engine_kwargs["enable_benchmark"] = True
 
 
 class AdminReconfigureRequest(BaseModel):
@@ -85,6 +107,7 @@ from .engine.streaming import (
     make_initial_stream_chunk,
     make_stream_chunk,
     make_stream_reasoning_chunk,
+    make_stream_tool_activity_chunk,
     make_stream_tool_calls_chunk,
 )
 
@@ -124,6 +147,8 @@ def _load_web_chat_html() -> str:
 def _initialize_model_runtime():
     global engine
     global conversation_worker
+    global tool_engine
+    global tool_conversation_worker
 
     litert_lm.set_min_log_severity(
         litert_lm.LogSeverity.ERROR
@@ -144,11 +169,14 @@ def _initialize_model_runtime():
         resolved_model_path = ensure_model(None)
         config.MODEL_PATH = resolved_model_path
         config.CURRENT_MODEL_KEY = model_key
+
     else:
         # No explicit path or no registry match — use registry if key found.
         resolved_model_path = ensure_model(model_key)
         config.MODEL_PATH = resolved_model_path
         config.CURRENT_MODEL_KEY = model_key
+
+    config.apply_model_runtime_defaults(model_key)
 
     cache_dir = os.environ.get(
         "LITERT_CACHE_DIR",
@@ -165,45 +193,51 @@ def _initialize_model_runtime():
     print(f"Disk cache: {Path(cache_dir).resolve()}")
     effective_max_num_tokens = _effective_max_num_tokens(model_key)
     print(f"KV capacity: {effective_max_num_tokens:,} tokens")
-    print(f"Default output limit: {DEFAULT_MAX_OUTPUT_TOKENS:,} tokens")
+    print(
+        "Default output limit: "
+        f"{config.DEFAULT_MAX_OUTPUT_TOKENS:,} tokens"
+    )
     print(
         "Tool response limit: "
-        f"{MAX_TOOL_RESPONSE_TOKENS:,} tokens per result"
+        f"{config.MAX_TOOL_RESPONSE_TOKENS:,} tokens per result"
     )
     print(
         "Context safety margin: "
-        f"{CONTEXT_SAFETY_MARGIN_TOKENS:,} tokens"
+        f"{config.CONTEXT_SAFETY_MARGIN_TOKENS:,} tokens"
     )
     print(
         "Inference watchdog: "
-        f"{INFERENCE_TIMEOUT_SECONDS:.0f} seconds"
+        f"{config.INFERENCE_TIMEOUT_SECONDS:.0f} seconds"
     )
     print(
         "Malformed tool-call retries: "
-        f"{MALFORMED_TOOL_CALL_RETRIES}"
+        f"{config.MALFORMED_TOOL_CALL_RETRIES}"
     )
     print(
         "Max workspace tool calls per generation: "
-        f"{MAX_TOOL_CALLS_PER_GENERATION}"
+        f"{config.MAX_TOOL_CALLS_PER_GENERATION}"
     )
     print(
         "Tool constrained decoding: "
-        f"{'enabled' if ENABLE_CONSTRAINED_DECODING else 'disabled'}"
+        f"{'enabled' if config.ENABLE_CONSTRAINED_DECODING else 'disabled'}"
     )
     print(
         "Default reasoning effort: "
-        f"{DEFAULT_REASONING_EFFORT}"
+        f"{config.DEFAULT_REASONING_EFFORT}"
     )
     print(
         "Default sampling: "
-        f"temperature={DEFAULT_TEMPERATURE}, "
-        f"top_p={DEFAULT_TOP_P}, top_k={DEFAULT_TOP_K}"
+        f"temperature={config.DEFAULT_TEMPERATURE}, "
+        f"top_p={config.DEFAULT_TOP_P}, top_k={config.DEFAULT_TOP_K}"
     )
-    print(f"Tool-call temperature: request/default ({DEFAULT_TEMPERATURE})")
+    print(
+        "Tool-call temperature: request/default "
+        f"({config.DEFAULT_TEMPERATURE})"
+    )
 
     engine_kwargs: dict[str, Any] = {
         "backend": backend,
-        "enable_speculative_decoding": ENABLE_SPECULATIVE_DECODING,
+        "enable_speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
         "max_num_tokens": effective_max_num_tokens,
     }
 
@@ -214,6 +248,13 @@ def _initialize_model_runtime():
     if "cache_dir" in engine_parameters:
         engine_kwargs["cache_dir"] = cache_dir
 
+    _apply_model_engine_options(
+        engine_kwargs,
+        engine_parameters,
+        model_key,
+        backend,
+    )
+
     config.engine = litert_lm.Engine(
         resolved_model_path,
         **engine_kwargs,
@@ -223,7 +264,10 @@ def _initialize_model_runtime():
 
     from .engine.worker import PersistentConversationWorker
 
-    conversation_worker = PersistentConversationWorker()
+    conversation_worker = PersistentConversationWorker(
+        config.engine,
+        name="primary",
+    )
     conversation_worker.start()
     config.conversation_worker = conversation_worker
 
@@ -245,10 +289,59 @@ def _initialize_model_runtime():
         "Malformed tool calls reset only the affected context "
         "before retry."
     )
-    print("Generation streaming: asynchronous for every request.")
+    print(
+        "Generation streaming: asynchronous for plain chat; "
+        "native workspace tools use blocking automatic execution."
+    )
     print(
         "Thinking channels stream as OpenAI delta.reasoning_content."
     )
+
+    if not _workspace_tooling_enabled_for_primary():
+        tool_engine = None
+        tool_conversation_worker = None
+        config.tool_engine = None
+        config.tool_conversation_worker = None
+        config.TOOL_MODEL_LOAD_ERROR = None
+        print(
+            "Native workspace tooling: disabled for Gemma 4 12B. Set "
+            "LITERT_ENABLE_12B_TOOLS=1 to override."
+        )
+        print(
+            "Client-supplied OpenAI function tools remain available on "
+            "the primary 12B model."
+        )
+    elif config.TOOL_ROUTING_ENABLED and _primary_is_tool_model():
+        tool_engine = None
+        tool_conversation_worker = None
+        config.tool_engine = None
+        config.tool_conversation_worker = None
+        config.TOOL_MODEL_LOAD_ERROR = None
+        print(
+            "Tool-model routing reuses the primary model; "
+            "no second engine was loaded."
+        )
+    elif config.TOOL_ROUTING_ENABLED:
+        try:
+            tool_engine, tool_conversation_worker = _create_tool_runtime()
+            config.tool_engine = tool_engine
+            config.tool_conversation_worker = tool_conversation_worker
+            config.TOOL_MODEL_LOAD_ERROR = None
+        except Exception as exc:
+            config.TOOL_MODEL_LOAD_ERROR = str(exc)
+            tool_engine = None
+            tool_conversation_worker = None
+            config.tool_engine = None
+            config.tool_conversation_worker = None
+            print(
+                "Tool-model routing is unavailable: "
+                f"{config.TOOL_MODEL_LOAD_ERROR}",
+                file=sys.stderr,
+                flush=True,
+            )
+    else:
+        print("Tool-model routing: disabled")
+
     print(
         f"Built-in web chat: "
         f"{'http://localhost:8000/' if config.WEB_UI_ENABLED else 'disabled'}"
@@ -258,6 +351,8 @@ def _initialize_model_runtime():
 async def lifespan(app: FastAPI):
     global engine
     global conversation_worker
+    global tool_engine
+    global tool_conversation_worker
 
     config.MODEL_LOADING = True
     config.MODEL_LOAD_ERROR = None
@@ -290,10 +385,20 @@ async def lifespan(app: FastAPI):
         conversation_worker = None
         config.conversation_worker = None
 
+    if tool_conversation_worker is not None:
+        tool_conversation_worker.stop()
+        tool_conversation_worker = None
+        config.tool_conversation_worker = None
+
     if engine is not None:
         config.engine.__exit__(None, None, None)
         config.engine = None
         engine = None
+
+    if tool_engine is not None:
+        tool_engine.__exit__(None, None, None)
+        tool_engine = None
+        config.tool_engine = None
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +450,12 @@ async def highlight_javascript():
 
 @app.post("/v1/conversation/reset")
 async def reset_conversation():
-    if conversation_worker is None:
+    workers = [
+        worker
+        for worker in (conversation_worker, tool_conversation_worker)
+        if worker is not None
+    ]
+    if not workers:
         raise HTTPException(
             status_code=503,
             detail="Model is not loaded.",
@@ -358,7 +468,8 @@ async def reset_conversation():
         )
 
     try:
-        conversation_worker.reset()
+        for worker in workers:
+            worker.reset()
         return {"status": "ok"}
     finally:
         _request_lock.release()
@@ -366,13 +477,20 @@ async def reset_conversation():
 
 @app.post("/v1/conversation/cancel")
 async def cancel_conversation():
-    if conversation_worker is None:
+    workers = [
+        worker
+        for worker in (conversation_worker, tool_conversation_worker)
+        if worker is not None
+    ]
+    if not workers:
         raise HTTPException(
             status_code=503,
             detail="Model is not loaded.",
         )
 
-    cancelled = conversation_worker.cancel_current()
+    cancelled = False
+    for worker in workers:
+        cancelled = worker.cancel_current() or cancelled
     return {
         "status": "cancelling" if cancelled else "idle",
     }
@@ -417,6 +535,18 @@ async def health():
     if model_key and model_key in MODEL_REGISTRY:
         model_display = MODEL_REGISTRY[model_key]["display"]
 
+    workspace_tooling_enabled = _workspace_tooling_enabled_for_primary()
+    tool_uses_primary = bool(
+        workspace_tooling_enabled
+        and config.TOOL_ROUTING_ENABLED
+        and _primary_is_tool_model()
+    )
+    routed_tool_worker = (
+        conversation_worker
+        if tool_uses_primary
+        else tool_conversation_worker
+    )
+
     return {
         "status": (
             "error"
@@ -427,21 +557,30 @@ async def health():
         ),
         "model_loading": config.MODEL_LOADING,
         "model_load_error": config.MODEL_LOAD_ERROR,
-        "backend": DEFAULT_BACKEND,
+        "backend": config.DEFAULT_BACKEND,
         "model": config.MODEL_PATH,
         "model_key": model_key,
         "model_display": model_display,
+        # Kept for older web clients; this means native workspace tooling.
+        "tooling_enabled": workspace_tooling_enabled,
+        "workspace_tooling_enabled": workspace_tooling_enabled,
+        "client_tooling_enabled": True,
+        "tooling_disabled_reason": (
+            None
+            if workspace_tooling_enabled
+            else "Native workspace tooling is disabled for Gemma 4 12B."
+        ),
         "max_num_tokens": _effective_max_num_tokens(model_key),
         "default_max_output_tokens": _effective_default_max_output_tokens(model_key),
-        "max_tool_response_tokens": MAX_TOOL_RESPONSE_TOKENS,
-        "context_safety_margin_tokens": CONTEXT_SAFETY_MARGIN_TOKENS,
-        "inference_timeout_seconds": INFERENCE_TIMEOUT_SECONDS,
+        "max_tool_response_tokens": config.MAX_TOOL_RESPONSE_TOKENS,
+        "context_safety_margin_tokens": config.CONTEXT_SAFETY_MARGIN_TOKENS,
+        "inference_timeout_seconds": config.INFERENCE_TIMEOUT_SECONDS,
         "cache_dir": os.environ.get(
             "LITERT_CACHE_DIR",
             str(Path(config.MODEL_PATH).parent),
         ),
-        "constrained_decoding": ENABLE_CONSTRAINED_DECODING,
-        "tool_temperature": DEFAULT_TEMPERATURE,
+        "constrained_decoding": config.ENABLE_CONSTRAINED_DECODING,
+        "tool_temperature": config.DEFAULT_TEMPERATURE,
         "tool_context_mode": config.TOOL_CONTEXT_MODE,
         "tool_request_mode": (
             "persistent-kv-chain"
@@ -453,15 +592,62 @@ async def health():
         "reasoning_stream_field": "choices[0].delta.reasoning_content",
         "web_ui_enabled": config.WEB_UI_ENABLED,
         "web_ui_path": "/" if config.WEB_UI_ENABLED else None,
-        "malformed_tool_call_retries": MALFORMED_TOOL_CALL_RETRIES,
+        "malformed_tool_call_retries": config.MALFORMED_TOOL_CALL_RETRIES,
         "max_tool_argument_string_length": (
-            MAX_TOOL_ARGUMENT_STRING_LENGTH
+            config.MAX_TOOL_ARGUMENT_STRING_LENGTH
         ),
         "conversation": (
             conversation_worker.status()
             if conversation_worker is not None
             else None
         ),
+        "tool_routing": {
+            "enabled": bool(
+                workspace_tooling_enabled and config.TOOL_ROUTING_ENABLED
+            ),
+            "model_key": config.TOOL_MODEL_KEY,
+            "model": (
+                config.MODEL_PATH
+                if tool_uses_primary
+                else config.TOOL_MODEL_PATH
+            ),
+            "backend": (
+                config.DEFAULT_BACKEND
+                if tool_uses_primary
+                else config.TOOL_BACKEND
+            ),
+            "max_num_tokens": (
+                _effective_max_num_tokens(config.CURRENT_MODEL_KEY)
+                if tool_uses_primary
+                else _effective_tool_max_num_tokens()
+            ),
+            "reasoning_effort": config.TOOL_REASONING_EFFORT,
+            "loaded": (
+                bool(
+                    workspace_tooling_enabled
+                    and (
+                        engine is not None
+                        if tool_uses_primary
+                        else tool_engine is not None
+                    )
+                )
+            ),
+            "uses_primary": tool_uses_primary,
+            "load_error": config.TOOL_MODEL_LOAD_ERROR,
+            "routes": (
+                []
+                if not workspace_tooling_enabled
+                else ["workspace_tools", "openai_tools"]
+                if config.TOOL_ROUTE_OPENAI_TOOLS
+                else ["workspace_tools"]
+            ),
+            "workspace_generation": "blocking-automatic-tools",
+            "conversation": (
+                routed_tool_worker.status()
+                if workspace_tooling_enabled and routed_tool_worker is not None
+                else None
+            ),
+        },
     }
 
 
@@ -485,16 +671,25 @@ async def list_models():
 async def chat_completions(
     request: ChatCompletionRequest,
 ):
-    if engine is None or conversation_worker is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model is not loaded.",
-        )
-
     if not request.messages:
         raise HTTPException(
             status_code=400,
             detail="messages must not be empty.",
+        )
+
+    has_openai_tools = bool(normalize_tool_definitions(request))
+    if (
+        request.workspace_tools
+        and not _workspace_tooling_enabled_for_primary()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Native server-side workspace tooling is disabled by "
+                "default for Gemma 4 12B. Client-supplied OpenAI function "
+                "tools remain available. "
+                "Set LITERT_ENABLE_12B_TOOLS=1 and restart to override."
+            ),
         )
 
     if request.workspace_tools:
@@ -532,6 +727,53 @@ async def chat_completions(
                 )
             request.workspace_shell_approval_id = approval_id
 
+    route_to_tool_model = bool(
+        config.TOOL_ROUTING_ENABLED
+        and _workspace_tooling_enabled_for_primary()
+        and (
+            request.workspace_tools
+            or (
+                has_openai_tools
+                and config.TOOL_ROUTE_OPENAI_TOOLS
+            )
+        )
+    )
+    tool_uses_primary = route_to_tool_model and _primary_is_tool_model()
+    selected_engine = (
+        engine
+        if tool_uses_primary or not route_to_tool_model
+        else tool_engine
+    )
+    selected_worker = (
+        conversation_worker
+        if tool_uses_primary or not route_to_tool_model
+        else tool_conversation_worker
+    )
+    selected_model_key = (
+        config.TOOL_MODEL_KEY
+        if route_to_tool_model
+        else config.CURRENT_MODEL_KEY
+    )
+
+    if route_to_tool_model:
+        # The E4B CPU bundle is reliable at automatic native tool execution
+        # with thinking disabled. At high reasoning it can exhaust a turn in
+        # the thought channel or stop after only the <|tool_call> marker.
+        request = request.model_copy(
+            update={
+                "reasoning_effort": config.TOOL_REASONING_EFFORT,
+            }
+        )
+
+    if selected_engine is None or selected_worker is None:
+        detail = (
+            "Tool model is not loaded: "
+            f"{config.TOOL_MODEL_LOAD_ERROR or 'unknown error'}"
+            if route_to_tool_model
+            else "Primary model is not loaded."
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
     if not _request_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=429,
@@ -547,9 +789,18 @@ async def chat_completions(
             normalized_messages,
         )
 
-        effective_max_num_tokens = _effective_max_num_tokens()
+        effective_max_num_tokens = (
+            _effective_tool_max_num_tokens()
+            if route_to_tool_model and not tool_uses_primary
+            else _effective_max_num_tokens(selected_model_key)
+        )
         with _console_lock:
             print(
+                "\n[model-route] "
+                f"{'tools' if route_to_tool_model else 'plain'} -> "
+                f"{selected_model_key or config.MODEL_PATH} "
+                f"({config.TOOL_BACKEND if route_to_tool_model and not tool_uses_primary else config.DEFAULT_BACKEND})"
+                f"{' reasoning=' + config.TOOL_REASONING_EFFORT if route_to_tool_model else ''}\n"
                 "\n[context-budget] "
                 f"messages≈{budget['message_tokens']:,} "
                 f"tools≈{budget['tool_schema_tokens']:,} "
@@ -577,14 +828,18 @@ async def chat_completions(
                 ),
             )
 
-        model_name = request.model or MODEL_PATH
+        model_name = (
+            selected_model_key
+            or request.model
+            or config.MODEL_PATH
+        )
         result_queue: queue.Queue = queue.Queue()
         job = InferenceJob(
             request=request,
             messages=normalized_messages,
             result_queue=result_queue,
         )
-        conversation_worker.submit(job)
+        selected_worker.submit(job)
     except Exception:
         _request_lock.release()
         raise
@@ -631,6 +886,13 @@ async def chat_completions(
                         )
                         continue
 
+                    if event == "tool_activity":
+                        yield make_stream_tool_activity_chunk(
+                            model_name,
+                            payload,
+                        )
+                        continue
+
                     if event == "done":
                         completed = True
                         finish_reason = (
@@ -664,8 +926,7 @@ async def chat_completions(
                     )
                 if not completed:
                     job.cancel_event.set()
-                    if conversation_worker is not None:
-                        conversation_worker.cancel_current()
+                    selected_worker.cancel_current()
 
                 _request_lock.release()
 
@@ -805,26 +1066,60 @@ def _effective_default_max_output_tokens(model_key: str | None = None) -> int:
     return min(config.DEFAULT_MAX_OUTPUT_TOKENS, int(model_limit))
 
 
-def _create_engine(backend=None):
+def _effective_tool_max_num_tokens() -> int:
+    return min(
+        config.TOOL_MAX_NUM_TOKENS,
+        _effective_max_num_tokens(config.TOOL_MODEL_KEY),
+    )
+
+
+def _create_engine(
+    backend=None,
+    *,
+    model_path: str | None = None,
+    model_key: str | None = None,
+    cache_dir_env: str = "LITERT_CACHE_DIR",
+    enable_speculative_decoding: bool | None = None,
+    max_num_tokens: int | None = None,
+):
+    active_model_key = (
+        config.CURRENT_MODEL_KEY
+        if model_key is None
+        else model_key
+    )
     if backend is None:
-        backend = resolve_backend(config.CURRENT_MODEL_KEY)
+        backend = resolve_backend(active_model_key)
+
+    if model_path is None:
+        model_path = config.MODEL_PATH
+
+    if enable_speculative_decoding is None:
+        enable_speculative_decoding = config.ENABLE_SPECULATIVE_DECODING
+    if max_num_tokens is None:
+        max_num_tokens = _effective_max_num_tokens(active_model_key)
 
     engine_kwargs: dict[str, Any] = {
         "backend": backend,
-        "enable_speculative_decoding": config.ENABLE_SPECULATIVE_DECODING,
-        "max_num_tokens": _effective_max_num_tokens(),
+        "enable_speculative_decoding": enable_speculative_decoding,
+        "max_num_tokens": max_num_tokens,
     }
 
     engine_parameters = set(
         inspect.signature(litert_lm.Engine).parameters
     )
 
-    model_path = config.MODEL_PATH
     if "cache_dir" in engine_parameters:
         engine_kwargs["cache_dir"] = os.environ.get(
-            "LITERT_CACHE_DIR",
+            cache_dir_env,
             str(Path(model_path).parent),
         )
+
+    _apply_model_engine_options(
+        engine_kwargs,
+        engine_parameters,
+        active_model_key,
+        backend,
+    )
 
     engine = litert_lm.Engine(
         model_path,
@@ -832,6 +1127,70 @@ def _create_engine(backend=None):
     )
     engine.__enter__()
     return engine
+
+
+def _create_tool_runtime():
+    """Load the dedicated tool model and start its conversation worker."""
+    from .engine.worker import PersistentConversationWorker
+
+    tool_key = config.TOOL_MODEL_KEY
+    if tool_key not in MODEL_REGISTRY:
+        raise RuntimeError(
+            f"Unknown LITERT_TOOL_MODEL_KEY: {tool_key!r}. "
+            f"Available: {', '.join(MODEL_REGISTRY)}"
+        )
+
+    configured_path = Path(config.TOOL_MODEL_PATH).expanduser()
+    registry_path = Path(config._MODELS_DIR) / f"{tool_key}.litertlm"
+    if configured_path == registry_path or not configured_path.is_file():
+        resolved_path = ensure_model(tool_key)
+    else:
+        resolved_path = str(configured_path.resolve())
+
+    config.TOOL_MODEL_PATH = resolved_path
+    backend = resolve_backend(
+        tool_key,
+        request_backend=config.TOOL_BACKEND,
+    )
+    backend_name = type(backend).__name__
+    print(
+        "Loading dedicated tool model with the "
+        f"{backend_name} backend..."
+    )
+    print(f"Tool model: {Path(resolved_path).resolve()}")
+    print(f"Tool model key: {tool_key}")
+    print(f"Tool reasoning effort: {config.TOOL_REASONING_EFFORT}")
+
+    loaded_engine = None
+    try:
+        loaded_engine = _create_engine(
+            backend=backend,
+            model_path=resolved_path,
+            model_key=tool_key,
+            cache_dir_env="LITERT_TOOL_CACHE_DIR",
+            # The tool model favors predictable latency over a second draft model.
+            enable_speculative_decoding=False,
+            max_num_tokens=_effective_tool_max_num_tokens(),
+        )
+        worker = PersistentConversationWorker(
+            loaded_engine,
+            name="tools",
+        )
+        worker.start()
+    except Exception:
+        if loaded_engine is not None:
+            loaded_engine.__exit__(None, None, None)
+        raise
+    print(
+        "Tool-model routing ready: native workspace tools -> "
+        f"{tool_key} ({config.TOOL_BACKEND}); plain chat -> "
+        f"{config.CURRENT_MODEL_KEY or config.MODEL_PATH}."
+    )
+    if config.TOOL_ROUTE_OPENAI_TOOLS:
+        print("Client-supplied OpenAI tools also use the tool model.")
+    else:
+        print("Client-supplied OpenAI tools use the primary model.")
+    return loaded_engine, worker
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +1223,7 @@ async def admin_get_config():
 @app.post("/v1/admin/reconfigure")
 async def admin_reconfigure(body: AdminReconfigureRequest):
     global engine, conversation_worker
+    global tool_engine, tool_conversation_worker
 
     if not _request_lock.acquire(blocking=False):
         raise HTTPException(
@@ -928,7 +1288,17 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
 
         print(f"\n[admin] Reconfiguring: {', '.join(changed)}")
 
-        # Stop and tear down current engine + worker
+        # Stop and tear down both routed runtimes.
+        if tool_conversation_worker is not None:
+            tool_conversation_worker.stop()
+            tool_conversation_worker = None
+            config.tool_conversation_worker = None
+
+        if tool_engine is not None:
+            tool_engine.__exit__(None, None, None)
+            tool_engine = None
+            config.tool_engine = None
+
         if conversation_worker is not None:
             conversation_worker.stop()
             conversation_worker = None
@@ -950,13 +1320,52 @@ async def admin_reconfigure(body: AdminReconfigureRequest):
 
         from .engine.worker import PersistentConversationWorker
 
-        conversation_worker = PersistentConversationWorker()
+        conversation_worker = PersistentConversationWorker(
+            engine,
+            name="primary",
+        )
         conversation_worker.start()
         config.conversation_worker = conversation_worker
 
-        print("[admin] Engine restarted with new configuration.")
+        tool_warning = None
+        if not _workspace_tooling_enabled_for_primary():
+            config.TOOL_MODEL_LOAD_ERROR = None
+            print(
+                "[admin] Native workspace tooling remains disabled for "
+                "Gemma 4 12B; client tools use the primary model."
+            )
+        elif config.TOOL_ROUTING_ENABLED and _primary_is_tool_model():
+            config.TOOL_MODEL_LOAD_ERROR = None
+            print(
+                "[admin] Tool routing reuses the primary model; "
+                "no second engine was loaded."
+            )
+        elif config.TOOL_ROUTING_ENABLED:
+            try:
+                tool_engine, tool_conversation_worker = _create_tool_runtime()
+                config.tool_engine = tool_engine
+                config.tool_conversation_worker = tool_conversation_worker
+                config.TOOL_MODEL_LOAD_ERROR = None
+            except Exception as exc:
+                tool_warning = str(exc)
+                config.TOOL_MODEL_LOAD_ERROR = tool_warning
+                tool_engine = None
+                tool_conversation_worker = None
+                config.tool_engine = None
+                config.tool_conversation_worker = None
+                print(
+                    f"[admin] Tool-model routing is unavailable: {tool_warning}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-        return {"status": "restarted", "changes": changed}
+        print("[admin] Routed engines restarted with new configuration.")
+
+        return {
+            "status": "restarted",
+            "changes": changed,
+            "tool_model_load_error": tool_warning,
+        }
     except Exception:
         _request_lock.release()
         raise
@@ -981,7 +1390,7 @@ async def admin_list_models():
             "display": entry["display"],
             "repo": entry["repo"],
             "filename": entry["filename"],
-            "backend": entry.get("backend", DEFAULT_BACKEND),
+            "backend": entry.get("backend", config.DEFAULT_BACKEND),
             "downloaded": dest.is_file(),
             "path": str(dest) if dest.is_file() else None,
         })
@@ -1003,6 +1412,7 @@ class SwitchModelRequest(BaseModel):
 async def admin_switch_model(body: SwitchModelRequest):
     """Switch to a different model from the registry."""
     global engine, conversation_worker
+    global tool_engine, tool_conversation_worker
 
     if body.key not in MODEL_REGISTRY:
         raise HTTPException(
@@ -1025,10 +1435,22 @@ async def admin_switch_model(body: SwitchModelRequest):
         resolved_path = ensure_model(body.key)
         config.MODEL_PATH = resolved_path
         config.CURRENT_MODEL_KEY = body.key
+        config.apply_model_runtime_defaults(body.key)
 
         print(f"[admin] Model path: {resolved_path}")
 
-        # Stop and tear down current engine + worker
+        # Stop and tear down current routed runtimes. The tool runtime is
+        # recreated only when the new primary is not already the tool model.
+        if tool_conversation_worker is not None:
+            tool_conversation_worker.stop()
+            tool_conversation_worker = None
+            config.tool_conversation_worker = None
+
+        if tool_engine is not None:
+            tool_engine.__exit__(None, None, None)
+            tool_engine = None
+            config.tool_engine = None
+
         if conversation_worker is not None:
             conversation_worker.stop()
             conversation_worker = None
@@ -1047,9 +1469,44 @@ async def admin_switch_model(body: SwitchModelRequest):
 
         from .engine.worker import PersistentConversationWorker
 
-        conversation_worker = PersistentConversationWorker()
+        conversation_worker = PersistentConversationWorker(
+            engine,
+            name="primary",
+        )
         conversation_worker.start()
         config.conversation_worker = conversation_worker
+
+        tool_warning = None
+        if not _workspace_tooling_enabled_for_primary():
+            config.TOOL_MODEL_LOAD_ERROR = None
+            print(
+                "[admin] Native workspace tooling is disabled for the new "
+                "12B primary; client tools use the primary model."
+            )
+        elif config.TOOL_ROUTING_ENABLED and _primary_is_tool_model():
+            config.TOOL_MODEL_LOAD_ERROR = None
+            print(
+                "[admin] Tool routing reuses the new primary model; "
+                "no second engine was loaded."
+            )
+        elif config.TOOL_ROUTING_ENABLED:
+            try:
+                tool_engine, tool_conversation_worker = _create_tool_runtime()
+                config.tool_engine = tool_engine
+                config.tool_conversation_worker = tool_conversation_worker
+                config.TOOL_MODEL_LOAD_ERROR = None
+            except Exception as exc:
+                tool_warning = str(exc)
+                config.TOOL_MODEL_LOAD_ERROR = tool_warning
+                tool_engine = None
+                tool_conversation_worker = None
+                config.tool_engine = None
+                config.tool_conversation_worker = None
+                print(
+                    f"[admin] Tool-model routing is unavailable: {tool_warning}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         print(f"[admin] Successfully switched to: {body.key}")
 
@@ -1058,6 +1515,7 @@ async def admin_switch_model(body: SwitchModelRequest):
             "key": body.key,
             "display": entry["display"],
             "path": resolved_path,
+            "tool_model_load_error": tool_warning,
         }
     except Exception:
         _request_lock.release()

@@ -112,11 +112,43 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .hljs-strong { font-weight:700; }
 .role { color:var(--muted); font-size:12px; text-transform:uppercase;
   letter-spacing:.08em; margin-bottom:6px; }
+.assistant-pending { display:inline-flex; align-items:center; gap:4px;
+  min-height:22px; color:var(--muted); }
+.assistant-pending[hidden] { display:none; }
+.assistant-pending-dot { width:5px; height:5px; border-radius:50%;
+  background:currentColor; opacity:.3; animation:assistant-pulse 1.15s ease-in-out infinite; }
+.assistant-pending-dot:nth-child(2) { animation-delay:.16s; }
+.assistant-pending-dot:nth-child(3) { animation-delay:.32s; }
+@keyframes assistant-pulse {
+  0%, 70%, 100% { opacity:.25; transform:translateY(0) scale(.9); }
+  35% { opacity:1; transform:translateY(-2px) scale(1.08); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .assistant-pending-dot { animation:none; opacity:.65; }
+}
 .reasoning { margin:0 0 12px; border:1px solid var(--line);
   border-radius:8px; background:var(--reasoning-bg); }
 .reasoning summary { cursor:pointer; color:var(--muted); padding:8px 10px; }
 .reasoning pre { margin:0; padding:0 10px 10px; white-space:pre-wrap;
   color:var(--reasoning-text); font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.tool-activity-list { display:grid; gap:8px; margin:0 0 12px; }
+.tool-activity-list:empty { display:none; }
+.tool-activity { border:1px solid var(--line); border-radius:8px;
+  background:var(--reasoning-bg); overflow:hidden; }
+.tool-activity-head { display:flex; align-items:center; justify-content:space-between;
+  gap:12px; padding:8px 10px; font-size:12px; }
+.tool-activity-name { color:var(--text); font-weight:650;
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+.tool-activity-status { color:var(--muted); text-transform:uppercase;
+  letter-spacing:.06em; font-size:10px; }
+.tool-activity details { border-top:1px solid var(--line); }
+.tool-activity summary { cursor:pointer; color:var(--muted); padding:7px 10px;
+  font-size:12px; }
+.tool-activity pre { max-height:280px; overflow:auto; margin:0; padding:0 10px 10px;
+  white-space:pre-wrap; overflow-wrap:anywhere; color:var(--reasoning-text);
+  font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.tool-activity.is-running .tool-activity-status { color:var(--accent); }
+.tool-activity.is-denied .tool-activity-status { color:var(--danger,#f85149); }
 .metrics { color:var(--muted); font-size:12px; margin-top:10px; }
 form { border-top:1px solid var(--line); background:var(--panel);
   padding:12px max(18px,calc((100vw - 900px)/2)); }
@@ -340,6 +372,7 @@ let shellApprovalTimer = null;
 let shellApprovalPollBusy = false;
 let activeShellApproval = null;
 let contextCapacity = 0;
+let toolingEnabled = true;
 let followOutput = true;
 const BOTTOM_FOLLOW_THRESHOLD = 48;
 
@@ -390,6 +423,7 @@ async function refreshContextUsage() {
     const response = await fetch("/health");
     if (!response.ok) return;
     const health = await response.json();
+    applyToolingAvailability(health);
     updateContextMeter(
       health.conversation?.context_tokens || 0,
       health.max_num_tokens
@@ -412,6 +446,17 @@ function createApprovalSessionId() {
 const shellApprovalSessionId = createApprovalSessionId();
 
 function updateWorkspaceTools() {
+  if (!toolingEnabled) {
+    workspaceTools.checked = false;
+    workspaceTools.disabled = true;
+    workspacePath.disabled = true;
+    workspaceReadOnly.disabled = true;
+    workspaceToolSummary.textContent = "Unavailable for Gemma 4 12B";
+    empty.textContent = "Tools are disabled for Gemma 4 12B.";
+    return;
+  }
+
+  workspaceTools.disabled = false;
   const enabled = workspaceTools.checked;
   workspacePath.disabled = !enabled;
   workspaceReadOnly.disabled = !enabled;
@@ -429,6 +474,23 @@ function updateWorkspaceTools() {
     "litert-workspace-read-only",
     workspaceReadOnly.checked ? "true" : "false"
   );
+}
+
+function applyToolingAvailability(health) {
+  const wasEnabled = toolingEnabled;
+  toolingEnabled =
+    (health?.workspace_tooling_enabled ?? health?.tooling_enabled) !== false;
+
+  if (!toolingEnabled) {
+    updateWorkspaceTools();
+    return;
+  }
+
+  if (!wasEnabled) {
+    workspaceTools.checked =
+      localStorage.getItem("litert-workspace-tools") === "true";
+  }
+  updateWorkspaceTools();
 }
 
 workspaceTools.checked =
@@ -501,6 +563,7 @@ async function waitForModelReady() {
     const resp = await fetch("/health");
     if (!resp.ok) throw new Error(resp.statusText);
     const health = await resp.json();
+    applyToolingAvailability(health);
 
     if (health.status === "loading") {
       updateContextMeter(0, health.max_num_tokens);
@@ -571,6 +634,7 @@ modelSelect.addEventListener("change", async () => {
     // Re-select the current model
     modelSelect.value = result.key;
     await loadChatDefaults();
+    await refreshContextUsage();
   } catch (e) {
     status.textContent = "Model switch failed: " + e.message;
     await loadModels();
@@ -602,12 +666,114 @@ function addMessage(role, text="") {
   const content = document.createElement("div");
   content.className = "message-content";
   content.textContent = text;
+  const pending = document.createElement("div");
+  pending.className = "assistant-pending";
+  pending.hidden = role !== "assistant" || Boolean(text);
+  pending.setAttribute("role", "status");
+  pending.setAttribute("aria-label", "Assistant is processing");
+  for (let index = 0; index < 3; index += 1) {
+    const dot = document.createElement("span");
+    dot.className = "assistant-pending-dot";
+    dot.setAttribute("aria-hidden", "true");
+    pending.append(dot);
+  }
+  const tools = document.createElement("div");
+  tools.className = "tool-activity-list";
   const metrics = document.createElement("div");
   metrics.className = "metrics";
-  box.append(roleEl, reasoning, content, metrics);
+  box.append(roleEl, pending, reasoning, tools, content, metrics);
   list.appendChild(box);
   scrollMessagesToBottom();
-  return {box, content, reasoning, reasoningText, metrics};
+  return {
+    box, pending, content, reasoning, reasoningText, tools, metrics,
+    toolCards: new Map()
+  };
+}
+
+function hideAssistantPending(message) {
+  if (message?.pending) message.pending.hidden = true;
+}
+
+function formatToolPayload(value) {
+  if (typeof value === "string") {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2);
+    } catch (_) {
+      return value;
+    }
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function renderToolActivity(message, activity) {
+  if (!activity || !activity.id) return;
+  hideAssistantPending(message);
+  let card = message.toolCards.get(activity.id);
+
+  if (!card) {
+    const box = document.createElement("section");
+    box.className = "tool-activity is-running";
+    const head = document.createElement("div");
+    head.className = "tool-activity-head";
+    const name = document.createElement("span");
+    name.className = "tool-activity-name";
+    const statusEl = document.createElement("span");
+    statusEl.className = "tool-activity-status";
+    head.append(name, statusEl);
+
+    const parameters = document.createElement("details");
+    parameters.open = true;
+    const parameterSummary = document.createElement("summary");
+    parameterSummary.textContent = "Parameters";
+    const parameterText = document.createElement("pre");
+    parameters.append(parameterSummary, parameterText);
+
+    const response = document.createElement("details");
+    response.style.display = "none";
+    const responseSummary = document.createElement("summary");
+    responseSummary.textContent = "Response passed back to the model";
+    const responseText = document.createElement("pre");
+    response.append(responseSummary, responseText);
+
+    box.append(head, parameters, response);
+    message.tools.append(box);
+    card = {
+      box, name, statusEl, parameters, parameterText,
+      response, responseSummary, responseText
+    };
+    message.toolCards.set(activity.id, card);
+  }
+
+  const count = activity.index != null
+    ? ` ${activity.index}/${activity.limit}`
+    : "";
+  card.name.textContent = `Tool${count} · ${activity.name || "unknown"}`;
+
+  if (activity.phase === "call") {
+    card.box.className = "tool-activity is-running";
+    card.statusEl.textContent = "running";
+    card.parameterText.textContent = formatToolPayload(activity.arguments ?? {});
+    status.textContent = `Running tool ${activity.name || "unknown"}…`;
+  } else if (activity.phase === "result") {
+    card.box.className = "tool-activity is-complete";
+    card.statusEl.textContent = activity.truncated ? "returned · truncated" : "returned";
+    card.parameters.open = false;
+    card.response.style.display = "";
+    card.responseText.textContent = formatToolPayload(activity.result);
+    status.textContent = `Tool ${activity.name || "unknown"} returned; generating…`;
+  } else if (activity.phase === "denied") {
+    card.box.className = "tool-activity is-denied";
+    card.statusEl.textContent = "denied";
+    card.response.style.display = "";
+    card.response.open = true;
+    card.responseSummary.textContent = "Tool was not executed";
+    card.responseText.textContent = activity.error || "Tool call denied.";
+    status.textContent = `Tool ${activity.name || "unknown"} was denied`;
+  }
 }
 
 function isSafeLink(href) {
@@ -882,7 +1048,7 @@ async function sendMessage(text) {
     frequency_penalty: Number(document.getElementById("freqPenalty").value),
     presence_penalty: Number(document.getElementById("presPenalty").value),
     seed: Number(document.getElementById("seed").value) || null,
-    workspace_tools: workspaceTools.checked,
+    workspace_tools: toolingEnabled && workspaceTools.checked,
     workspace_path: workspacePath.value.trim() || null,
     workspace_read_only: workspaceReadOnly.checked,
     workspace_shell_approval_id: shellApprovalSessionId,
@@ -926,29 +1092,51 @@ async function sendMessage(text) {
         if (event.error) throw new Error(event.error.message);
 
         const delta = event.choices?.[0]?.delta || {};
+        if (delta.tool_activity) {
+          renderToolActivity(assistant, delta.tool_activity);
+        }
         if (delta.reasoning_content) {
+          hideAssistantPending(assistant);
           thinking += delta.reasoning_content;
           assistant.reasoning.style.display = "";
           assistant.reasoningText.textContent = thinking;
         }
         if (delta.content) {
+          hideAssistantPending(assistant);
           answer += delta.content;
           assistant.content.textContent = answer;
         }
         if (event.usage) {
+          hideAssistantPending(assistant);
           const u = event.usage;
           const contextTokens = u.context_tokens ?? u.total_tokens;
           if (contextTokens != null) updateContextMeter(contextTokens);
           const fields = [];
+          if (u.total_seconds != null)
+            fields.push(`total ${u.total_seconds.toFixed(2)}s`);
           if (u.time_to_first_token != null)
             fields.push(`TTFT ${u.time_to_first_token.toFixed(2)}s`);
           if (u.prefill_tokens_per_second != null)
-            fields.push(`PPS ${u.prefill_tokens_per_second.toFixed(1)}`);
+            fields.push(`PPS ${u.prefill_tokens_per_second.toFixed(1)} tok/s`);
           if (u.decode_tokens_per_second != null)
-            fields.push(`TPS ${u.decode_tokens_per_second.toFixed(1)}`);
-          if (u.reasoning_tokens != null)
+            fields.push(`TPS ${u.decode_tokens_per_second.toFixed(1)} tok/s`);
+          else if (u.blocking_response) {
+            const overallRate = u.generation_tokens_per_second ??
+              u.end_to_end_tokens_per_second;
+            if (overallRate != null)
+              fields.push(`E2E ${overallRate.toFixed(1)} tok/s`);
+            fields.push("PPS/TPS n/a (blocking tool run)");
+          } else if (u.end_to_end_tokens_per_second != null) {
+            fields.push(`E2E ${u.end_to_end_tokens_per_second.toFixed(1)} tok/s`);
+          }
+          if (u.completion_tokens != null)
+            fields.push(`output ${u.completion_tokens} tok`);
+          if (u.reasoning_tokens > 0)
             fields.push(`thinking ${u.reasoning_tokens} tok`);
           assistant.metrics.textContent = fields.join(" · ");
+          assistant.metrics.title = u.blocking_response
+            ? "E2E is final-output tokens divided by the complete blocking tool-run time. LiteRT does not expose separate prefill and decode timing for this path."
+            : "PPS is prompt prefill throughput; TPS is generated-token decode throughput.";
         }
         scrollMessagesToBottom();
       }
@@ -965,9 +1153,11 @@ async function sendMessage(text) {
     status.textContent = "Ready";
   } catch (error) {
     if (error.name === "AbortError") {
+      hideAssistantPending(assistant);
       updateContextMeter(0);
       status.textContent = "Stopped";
     } else {
+      hideAssistantPending(assistant);
       assistant.content.textContent = `Error: ${error.message}`;
       status.textContent = "Error";
     }
@@ -1182,7 +1372,7 @@ document.getElementById("newChat").addEventListener("click", async () => {
 const serverFields = [
   {id:"sMaxNumTokens", key:"max_num_tokens", label:"Context window (tokens)", min:2048, type:"number"},
   {id:"sMaxOutTokens", key:"default_max_output_tokens", label:"Default max output tokens", min:64, type:"number"},
-  {id:"sToolRespTokens", key:"max_tool_response_tokens", label:"Max tool response tokens", min:64, type:"number"},
+  {id:"sToolRespTokens", key:"max_tool_response_tokens", label:"Max tool response tokens", min:64, type:"number", toolOnly:true},
   {id:"sSafetyMargin", key:"context_safety_margin_tokens", label:"Safety margin (tokens)", min:64, type:"number"},
   {id:"sTimeout", key:"inference_timeout_seconds", label:"Inference timeout (seconds)", min:10, type:"number"},
   {id:"sTemperature", key:"temperature", label:"Default temperature", min:0, max:2, step:0.05, type:"number"},
@@ -1190,10 +1380,10 @@ const serverFields = [
   {id:"sTopK", key:"top_k", label:"Default Top-K", min:1, max:256, type:"number"},
   {id:"sReasoning", key:"reasoning_effort", label:"Reasoning effort", type:"select", options:["none","minimal","low","medium","high","xhigh"]},
   {id:"sRepPenalty", key:"repetition_penalty", label:"Repetition penalty", min:1, max:2, step:0.01, type:"number"},
-  {id:"sRetries", key:"malformed_tool_call_retries", label:"Tool-call retries", min:0, max:5, type:"number"},
-  {id:"sToolArgLength", key:"max_tool_argument_string_length", label:"Max tool argument string length", min:512, type:"number"},
-  {id:"sToolCallsPerGen", key:"max_tool_calls_per_generation", label:"Max workspace tool calls per generation", min:1, max:50, type:"number"},
-  {id:"sConstrained", key:"constrained_decoding", label:"Constrained decoding", type:"select", options:["true","false"]},
+  {id:"sRetries", key:"malformed_tool_call_retries", label:"Tool-call retries", min:0, max:6, type:"number", toolOnly:true},
+  {id:"sToolArgLength", key:"max_tool_argument_string_length", label:"Max tool argument string length", min:512, type:"number", toolOnly:true},
+  {id:"sToolCallsPerGen", key:"max_tool_calls_per_generation", label:"Max workspace tool calls per generation", min:1, max:100, type:"number", toolOnly:true},
+  {id:"sConstrained", key:"constrained_decoding", label:"Constrained decoding", type:"select", options:["true","false"], toolOnly:true},
   {id:"sSpecDecoding", key:"speculative_decoding", label:"Speculative decoding", type:"select", options:["true","false"]},
 ];
 
@@ -1224,6 +1414,10 @@ function buildGrid(config) {
       input.value = config[f.key] ?? "";
     }
     input.id = f.id;
+    if (f.toolOnly && !toolingEnabled) {
+      input.disabled = true;
+    label.title = "Native workspace tooling is disabled for Gemma 4 12B.";
+    }
     label.appendChild(input);
     serverGrid.appendChild(label);
   });
@@ -1252,8 +1446,8 @@ async function loadChatDefaults() {
     if (config.reasoning_effort != null)
       document.getElementById("effort").value = config.reasoning_effort;
     if (config.default_max_output_tokens != null) {
-      const safety = config.context_safety_margin_tokens || 0;
-      document.getElementById("maxTokens").value = Math.max(1, config.default_max_output_tokens - safety);
+      document.getElementById("maxTokens").value =
+        Math.max(1, config.default_max_output_tokens);
     }
     if (config.temperature != null)
       document.getElementById("temperature").value = config.temperature;
@@ -1300,6 +1494,8 @@ document.getElementById("serverRestart").addEventListener("click", async () => {
     const result = await resp.json();
     serverStatus.textContent = "Done. " + result.changes.join(", ");
     updateContextMeter(0);
+    // Re-fetch health so the context meter reflects the new capacity
+    await refreshContextUsage();
     // Refresh the displayed config
     const cfg = await fetch("/v1/admin/config").then(r => r.json());
     buildGrid(cfg);
